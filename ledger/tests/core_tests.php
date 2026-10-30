@@ -611,3 +611,26 @@ function test_ledger_year_end_close_moves_earnings_without_double_counting(): vo
         check_same([], ledger_tie_outs($pdo, $b, $basis, '2025-12-01', '2026-01-31'), "tie-outs across the year end, $basis");
     }
 }
+
+function test_ledger_partnership_year_end_splits_by_share(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('partners');
+    ledger_book_set_entity($pdo, $b, 'pllc', 'partnership');
+    try {
+        ledger_profit_shares_set($pdo, $b, '2025-01-01', ['Ana' => '60', 'Ben' => '30'], 'owner');
+        check(false, 'shares that add up to 90% were accepted');
+    } catch (LedgerError) {
+    }
+    ledger_profit_shares_set($pdo, $b, '2025-01-01', ['Ana' => '60', 'Ben' => '40'], 'owner');
+    ledger_profit_shares_set($pdo, $b, '2026-01-01', ['Ana' => '50', 'Ben' => '50'], 'owner');
+    check_same(['Ana' => 6000, 'Ben' => 4000], ledger_profit_shares($pdo, $b, '2025-12-31'), 'the 2025 shares');
+    ledger_post($pdo, $b, ['entry_on' => '2025-05-01', 'lines' => [['account' => 'cash.operating', 'debit' => 100001], ['account' => 'revenue.services', 'credit' => 100001]]]);
+    ledger_year_end_close($pdo, $b, '2025-12-31', 'owner');
+    $ana = ledger_partner_capital($pdo, $b, 'Ana');
+    $ben = ledger_partner_capital($pdo, $b, 'Ben');
+    check_same([-60001, -40000], [ledger_balance($pdo, $b, $ana, 'accrual'), ledger_balance($pdo, $b, $ben, 'accrual')], 'each partner takes their share (the odd cent to the larger)');
+    $eq = ledger_equity_statement($pdo, $b, 'accrual', '2025-01-01', '2025-12-31');
+    check_same(100001, $eq['totals']['closing'], 'equity after the split');
+    check(in_array('Ana', array_column($eq['rows'], 'owner'), true), 'the equity statement does not show each partner');
+    check_same([], ledger_tie_outs($pdo, $b, 'accrual', '2025-01-01', '2025-12-31'), 'tie-outs after the split');
+}

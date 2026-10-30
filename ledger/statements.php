@@ -627,8 +627,9 @@ function ledger_year_end_close(PDO $pdo, int $bookId, string $fyEnd, string $act
     if ($book['locked_through'] !== null && $book['locked_through'] >= $fyEnd) {
         throw new LedgerError('The year end is already locked; close the year before signing its last month.');
     }
+    $split = $target === null && $book['tax_treatment'] === 'partnership';
     $target = $target ?? (in_array($book['tax_treatment'], ['s_corp', 'c_corp', 'unspecified'], true) ? 'equity.retained' : 'equity.capital');
-    return ledger_atomic($pdo, function () use ($pdo, $bookId, $fyStart, $fyEnd, $actor, $target) {
+    return ledger_atomic($pdo, function () use ($pdo, $bookId, $fyStart, $fyEnd, $actor, $target, $split) {
         $out = [];
         foreach (['accrual', 'cash'] as $basis) {
             $lines = [];
@@ -643,7 +644,23 @@ function ledger_year_end_close(PDO $pdo, int $bookId, string $fyEnd, string $act
             if (!$lines) {
                 continue;
             }
-            $lines[] = ['account' => $target, 'credit' => $ni, 'memo' => 'Net income for the year ending ' . $fyEnd];
+            $shares = $split ? ledger_profit_shares($pdo, $bookId, $fyEnd) : [];
+            if ($shares) {
+                // Each partner's capital takes their share; the rounding cent goes to the largest share.
+                $left = $ni;
+                arsort($shares);
+                $first = array_key_first($shares);
+                foreach ($shares as $party => $bp) {
+                    $part = $party === $first ? 0 : (int) round($ni * $bp / 10000);
+                    $left -= $part;
+                    if ($party !== $first) {
+                        $lines[] = ['account' => ledger_partner_capital($pdo, $bookId, $party), 'credit' => $part, 'memo' => 'Share of net income, year ending ' . $fyEnd];
+                    }
+                }
+                $lines[] = ['account' => ledger_partner_capital($pdo, $bookId, (string) $first), 'credit' => $left, 'memo' => 'Share of net income, year ending ' . $fyEnd];
+            } else {
+                $lines[] = ['account' => $target, 'credit' => $ni, 'memo' => 'Net income for the year ending ' . $fyEnd];
+            }
             $out[$basis] = ledger_post($pdo, $bookId, [
                 'entry_on' => $fyEnd, 'basis' => $basis, 'source_key' => "year_end:$fyEnd:$basis", 'event_type' => 'period.year_end',
                 'rule' => 'core.year_end', 'rule_version' => 1, 'memo' => 'Year-end close, ' . $fyStart . ' to ' . $fyEnd . ' (' . $basis . ')',
@@ -652,4 +669,53 @@ function ledger_year_end_close(PDO $pdo, int $bookId, string $fyEnd, string $act
         }
         return $out;
     });
+}
+
+
+/**
+ * Set the partners' profit shares from a date (each [party => percent as a
+ * string or basis points as int]); they must add up to 100%.
+ */
+function ledger_profit_shares_set(PDO $pdo, int $bookId, string $from, array $shares, string $actor): void
+{
+    if (!ledger_is_date($from)) {
+        throw new LedgerError('Give the date the shares take effect.');
+    }
+    $bp = [];
+    foreach ($shares as $party => $v) {
+        $party = trim((string) $party);
+        $n = is_int($v) ? $v : (int) round(((float) str_replace('%', '', (string) $v)) * 100);
+        if ($party === '' || $n < 0) {
+            throw new LedgerError('Each partner needs a name and a share.');
+        }
+        if ($n > 0) {
+            $bp[$party] = $n;
+        }
+    }
+    if (array_sum($bp) !== 10000) {
+        throw new LedgerError(sprintf('The shares add up to %s%%, not 100%%.', number_format(array_sum($bp) / 100, 2)));
+    }
+    ledger_atomic($pdo, function () use ($pdo, $bookId, $from, $bp, $actor) {
+        $ins = $pdo->prepare('INSERT INTO ledger.profit_shares (book_id, owner_party, share_bp, effective_from, actor) VALUES (:b, :p, :s, :f, :a)');
+        foreach ($bp as $party => $n) {
+            $ins->execute(['b' => $bookId, 'p' => mb_substr($party, 0, 120), 's' => $n, 'f' => $from, 'a' => mb_substr($actor, 0, 120)]);
+        }
+    });
+}
+
+/** The shares in effect on a day: [party => basis points], or [] when none are set. */
+function ledger_profit_shares(PDO $pdo, int $bookId, string $on): array
+{
+    $q = $pdo->prepare('SELECT owner_party, share_bp FROM ledger.profit_shares WHERE book_id = :b AND effective_from =
+                          (SELECT MAX(effective_from) FROM ledger.profit_shares WHERE book_id = :b2 AND effective_from <= :d) ORDER BY owner_party');
+    $q->execute(['b' => $bookId, 'b2' => $bookId, 'd' => $on]);
+    return array_map('intval', $q->fetchAll(PDO::FETCH_KEY_PAIR));
+}
+
+/** Each partner's own capital account (made when first needed). */
+function ledger_partner_capital(PDO $pdo, int $bookId, string $party): int
+{
+    $key = 'equity.capital.' . substr(hash('sha256', $party), 0, 16);
+    return ledger_account_ensure($pdo, $bookId, ['3010', 'Capital: ' . $party, 'equity', "Partners' capital", 'financing',
+        ['key' => $key, 'equity_type' => 'capital', 'owner_party' => $party]]);
 }
