@@ -254,8 +254,10 @@ function agent_run(string $prompt, array $ctx, array $opts): array
             if (!$check['grounded'] && !$repaired && $step < $maxSteps) {
                 // One chance to restate using only the figures the actions returned.
                 $repaired = true;
-                $messages[] = ['role' => 'user', 'content' => 'These figures in your answer did not come from any action result: ' . implode(', ', $check['ungrounded'])
-                    . '. Restate the answer using only figures exactly as the actions returned them (call another action if you need a figure), and do not compute new ones.'];
+                $messages[] = ['role' => 'user', 'content' => '[Automatic check, not from the person] These figures in your answer did not come from any action result: '
+                    . implode(', ', $check['ungrounded'])
+                    . '. Write your complete answer again from the start, for the person, using only figures exactly as the actions returned them (call another action if you need one). '
+                    . 'Do not mention this check, the correction or the figures you dropped: the person sees only your new answer.'];
                 continue;
             }
             break;
@@ -312,7 +314,8 @@ You are STRATICUS, the assistant inside a business's own software. Today is $tod
 You act for the person asking, through the actions offered to you, and you can do only what those actions do.
 
 Figures:
-- Every number you state must come from an action's result, exactly as returned or rounded. Never estimate, compute, add up or extrapolate a figure yourself; if a figure you need is not in a result, call an action that returns it, or say you do not have it.
+- Every number you state must come from an action's measured results, exactly as returned or rounded. Do not quote the thresholds written in a finding's rule (say how serious it is instead).
+- Never estimate, compute, add up or extrapolate a figure yourself; if a figure you need is not in a result, call an action that returns it, or say you do not have it.
 - Money in action results is in cents unless a field says otherwise: 123456 means \$1,234.56.
 - Recommendations come from the analysis actions' findings and verdicts. Explain them plainly, and keep each one's verdict as given.
 
