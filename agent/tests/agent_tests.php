@@ -13,6 +13,10 @@ require_once dirname(__DIR__) . '/agent.php';
 function at_script(array $replies, array &$sent): callable
 {
     return function (array $body) use (&$replies, &$sent) {
+        // What the real API would refuse: a tool call's input sent back as a JSON list.
+        if (preg_match('/"type":"tool_use"[^}]*"input":\[/', json_encode($body))) {
+            throw new RuntimeException('a tool_use input went back as a list, not an object');
+        }
         $sent[] = $body;
         $r = array_shift($replies);
         if ($r === null) {

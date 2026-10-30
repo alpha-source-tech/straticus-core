@@ -238,7 +238,14 @@ function agent_run(string $prompt, array $ctx, array $opts): array
             $usage[$k] += (int) ($res['usage'][$k] ?? 0);
         }
         $content = (array) ($res['content'] ?? []);
-        $messages[] = ['role' => 'assistant', 'content' => $content];
+        // Sent back exactly as the model wrote it. A tool call with no input decodes in PHP
+        // as an empty array, which would go back as a JSON list ([]) and be refused: keep it an object.
+        $messages[] = ['role' => 'assistant', 'content' => array_map(function ($b) {
+            if (($b['type'] ?? '') === 'tool_use' && (!is_array($b['input'] ?? null) || $b['input'] === [])) {
+                $b['input'] = new stdClass();
+            }
+            return $b;
+        }, $content)];
         $uses = array_values(array_filter($content, fn($b) => ($b['type'] ?? '') === 'tool_use'));
         $text = trim(implode("\n", array_map(fn($b) => (string) $b['text'], array_filter($content, fn($b) => ($b['type'] ?? '') === 'text'))));
         if (!$uses) {
