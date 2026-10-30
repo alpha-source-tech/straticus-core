@@ -577,16 +577,17 @@ function ledger_settle(PDO $pdo, int $bookId, int $docId, array $s): int
         $recv = $doc['kind'] === 'receivable';
         $sign = $recv ? 1 : -1;   // a receivable brings cash in; a payable sends it out
 
+        $cashParty = (string) ($s['cash_party'] ?? '');   // when the money comes from a party's own credit, not a bank
         $accrual = ledger_post($pdo, $bookId, [
             'entry_on' => $on, 'basis' => 'accrual', 'source_key' => $s['source_key'] . '#accrual',
             'event_type' => $recv ? 'receivable.paid' : 'payable.paid', 'rule' => 'core.settle', 'rule_version' => 1,
             'memo' => $s['memo'] ?? ('Payment on ' . $doc['ref']), 'actor' => $actor,
             'lines' => [
-                ['account' => $cash, 'debit' => $sign * $amt],
+                ['account' => $cash, 'debit' => $sign * $amt, 'party' => $cashParty],
                 ['account' => (int) $doc['control_account_id'], 'credit' => $sign * $amt, 'party' => $doc['party']],
             ],
         ]);
-        $cashLines = [['account' => $cash, 'debit' => $sign * $amt]];
+        $cashLines = [['account' => $cash, 'debit' => $sign * $amt, 'party' => $cashParty]];
         if ($alloc === null) {
             $cashLines[] = ['account' => 'unapplied_receipts', 'credit' => $sign * $amt, 'memo' => 'Awaiting assignment to lines'];
         } else {
