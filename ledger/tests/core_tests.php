@@ -764,7 +764,10 @@ function test_ledger_feasibility_verdicts_from_hand_worked_books(): void
     check_same(-600000, $r['figures']['monthly_change'], 'hire cost a month');
     check_same(100000, $r['figures']['avg_monthly_net_after'], 'net after: 7,000 - 6,000');
     check_same(10.0, $r['figures']['net_margin_pct_after'], 'margin after: 1,000 / 10,000');
-    check_same(4400000, $r['figures']['lowest_cash_90d_after'], 'lowest cash: 56,000 - 4 x 3,000');
+    // Usual collections ($10,000 a month, cash basis) are expected from Aug 14, on the 28th, at the low band of 70%:
+    // 56,000 - 3,000 (Aug 15) is the low point before $7,000 arrives on Aug 28.
+    check_same(1000000, $r['figures']['expected_monthly_collections'], 'run-rate collections');
+    check_same(5300000, $r['figures']['lowest_cash_90d_after'], 'lowest cash: 56,000 - 3,000 on Aug 15');
     // At $90,000 the practice would lose money every month.
     $r = ledger_feasibility($pdo, $b, $on, ['kind' => 'hire', 'annual_salary' => 9000000, 'starts_on' => '2026-08-01']);
     check_same('not_recommended', $r['verdict'], 'an unaffordable hire');
@@ -780,7 +783,7 @@ function test_ledger_feasibility_verdicts_from_hand_worked_books(): void
     $r = ledger_feasibility($pdo, $b, $on, ['kind' => 'loan', 'principal' => 1000000, 'monthly_payment' => 100000, 'on' => '2026-07-20']);
     check_same('recommended', $r['verdict'], 'a small loan');
     check_same(5600000, $r['figures']['lowest_cash_90d_after'], 'the low point is today, before the loan arrives');
-    check_same(6400000, end($r['forecast_after'])['cash_end'], 'cash after 90 days: 56,000 + 10,000 - 2,000');
+    check_same(8400000, end($r['forecast_after'])['cash_end'], 'cash after 90 days: 56,000 + 10,000 loan - 2,000 payments + 2 x 10,000 usual collections');
     // No cash in the books yet: an unaffordable hire stays not recommended (it is not softened to caution).
     ['pdo' => $pdo2, 'book' => $b2] = ledger_test_book('feasible-nocash');
     foreach (['04', '05', '06'] as $mo) {

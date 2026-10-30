@@ -382,6 +382,20 @@ function ledger_feasibility(PDO $pdo, int $bookId, string $asOf, array $s, array
             $monthlyDelta = $m;
             break;
     }
+    // The forecast knows only what is already billed. A practice that keeps working keeps
+    // billing, so with three months of history its usual collections (cash-basis revenue,
+    // averaged) are expected on the 28th of each month from a month out, once today's
+    // receivables have had time to come in, with a 30% band. Recurring costs alone,
+    // without the revenue that pays them, would make every decision look unaffordable.
+    $runRate = 0;
+    if ($p['months_with_activity'] >= 3) {
+        $cashMonths = ledger_monthly($pdo, $bookId, 'cash', $asOf, 3);
+        $runRate = max(0, (int) round(ledger_avg(array_column($cashMonths, 'revenue'))));
+        if ($runRate > 0) {
+            $recurring[] = ['name' => 'Usual monthly collections (last three months)', 'amount' => $runRate, 'day' => 28,
+                            'from' => gmdate('Y-m-d', strtotime("$asOf +30 days")), 'direction' => 'in', 'band' => 0.3];
+        }
+    }
     $before = ledger_cash_forecast($pdo, $bookId, $asOf, $recurring);
     $after = ledger_cash_forecast($pdo, $bookId, $asOf, array_merge($recurring, $extra));
     $low = fn(array $fc) => $fc['lowest'] === null ? null : (int) $fc['lowest']['amount'];
@@ -436,7 +450,7 @@ function ledger_feasibility(PDO $pdo, int $bookId, string $asOf, array $s, array
             'avg_monthly_net_before' => $p['avg_monthly_net'], 'avg_monthly_net_after' => $netAfter,
             'net_margin_pct_before' => $p['net_margin_pct'], 'net_margin_pct_after' => $marginAfter,
             'runway_months_before' => $p['runway_months'], 'runway_months_after' => $runwayAfter,
-            'monthly_change' => $monthlyDelta,
+            'monthly_change' => $monthlyDelta, 'expected_monthly_collections' => $runRate,
         ],
         'forecast_after' => $after['windows'],
     ];

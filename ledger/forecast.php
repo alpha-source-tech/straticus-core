@@ -151,9 +151,16 @@ function ledger_cash_forecast(PDO $pdo, int $bookId, string $asOf, array $recurr
                 continue;
             }
             $i = $windowOf($d);
-            $items[] = ['kind' => $dir, 'ref' => (string) ($r['name'] ?? 'Recurring'), 'party' => '', 'amount' => $amt, 'due_on' => $d, 'expected_on' => $d, 'window' => $i, 'band' => 0];
+            // Money expected in on a run rate (not yet billed) may carry an uncertainty band.
+            $band = $dir === 'in' ? max(0.0, min(0.5, (float) ($r['band'] ?? 0))) : 0.0;
+            $items[] = ['kind' => $dir, 'ref' => (string) ($r['name'] ?? 'Recurring'), 'party' => '', 'amount' => $amt, 'due_on' => $d, 'expected_on' => $d, 'window' => $i,
+                        'band' => round($band * 100, 1)];
             if ($i !== null) {
                 $windows[$i][$dir] += $amt;
+                if ($band > 0) {
+                    $windows[$i]['band_w'] += $band * $amt;
+                    $windows[$i]['band_amt'] += $amt;
+                }
             }
         }
     }
