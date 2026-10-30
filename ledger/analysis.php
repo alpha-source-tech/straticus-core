@@ -324,6 +324,7 @@ function ledger_feasibility(PDO $pdo, int $bookId, string $asOf, array $s, array
     }
     $p = ledger_financial_profile($pdo, $bookId, $asOf);
     $start = ledger_is_date((string) ($s['starts_on'] ?? $s['on'] ?? '')) ? (string) ($s['starts_on'] ?? $s['on']) : $asOf;
+    $start = max($start, $asOf);   // something already past is in the books, not a decision to test
     $extra = [];
     $monthlyDelta = 0;     // change to monthly net income (cents)
     $label = '';
@@ -420,7 +421,7 @@ function ledger_feasibility(PDO $pdo, int $bookId, string $asOf, array $s, array
         $reasons[] = sprintf('Cash would last about %s months at the new pace.', $runwayAfter);
     }
     if ($lowAfter === null) {
-        $verdict = 'caution';
+        $verdict = $verdict === 'not_recommended' ? $verdict : 'caution';
         $reasons[] = 'The books have no cash balance yet, so the effect on cash cannot be measured.';
     }
     if (!$reasons) {

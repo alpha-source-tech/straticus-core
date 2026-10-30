@@ -164,4 +164,13 @@ function test_agent_number_grounding_rules(): void
         check_same(['grounded' => false, 'ungrounded' => [$bad]], $ok($t), "ungrounded: $t");
     }
     check(!agent_verify_numbers('Cash is $56,000.', [['ok' => false, 'error' => 'x', 'result' => ['cash' => 5600000]]])['grounded'], 'a failed call grounds nothing');
+    // Review follow-ups: money that looks like a year is checked; dates without a year are dates;
+    // a rule's thresholds ground nothing; the person's words ground nothing on their own.
+    check_same(['$2050'], $ok('You owe $2050 in fees for 2026.')['ungrounded'], 'a dollar amount in the year range');
+    check($ok('due 12/15 and 1/3')['grounded'], 'month/day dates');
+    $rule = [['ok' => true, 'result' => ['share_pct' => 22.5, 'rule' => 'More than 20% is over 60 days (40% is critical).', 'advice' => 'Chase the $9,999.00.']]];
+    check_same(['40%', '$9,999.00'], agent_verify_numbers('Old receivables are 40%, about $9,999.00.', $rule)['ungrounded'], 'thresholds and advice text do not ground');
+    check(agent_verify_numbers('Old receivables are 22.5%.', $rule)['grounded'], 'the measured value does');
+    check_same(['$50,000'], agent_verify_numbers('Yes, net income is $50,000.', [], 'is our net income about $50,000?')['ungrounded'], 'the prompt alone grounds nothing');
+    check(agent_verify_numbers('A hire at $50,000 leaves $56,000.', $calls, 'can we hire at $50,000?')['grounded'], 'the prompt grounds alongside the books');
 }

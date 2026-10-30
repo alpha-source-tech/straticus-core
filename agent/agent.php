@@ -318,6 +318,9 @@ TXT . (isset($ctx['system']) ? "\n\n" . $ctx['system'] : ''));
 
 /* ── Number grounding ─────────────────────────────────────────────────── */
 
+/** Result fields whose text is rules or boilerplate, never a measured figure. */
+const AGENT_UNGROUNDING_KEYS = ['rule', 'advice', 'note', 'description'];
+
 /**
  * Every figure in $text must appear in an action result or in the person's
  * own request. A figure matches when a source value, rounded to the
@@ -334,8 +337,10 @@ function agent_verify_numbers(string $text, array $calls, string $prompt = ''): 
     $walk = function (mixed $v) use (&$walk, &$sources) {
         if (is_array($v)) {
             foreach ($v as $k => $x) {
-                if (is_string($k)) {
-                    $walk($k);
+                // Fixed thresholds and boilerplate are not measurements: "under 80%" in a
+                // rule must not ground "collections are 80%".
+                if (is_string($k) && in_array($k, AGENT_UNGROUNDING_KEYS, true)) {
+                    continue;
                 }
                 $walk($x);
             }
@@ -350,12 +355,16 @@ function agent_verify_numbers(string $text, array $calls, string $prompt = ''): 
             }
         }
     };
+    $any = false;
     foreach ($calls as $c) {
         if ($c['ok'] ?? false) {
             $walk($c['result'] ?? null);   // not the input: the model chose that
+            $any = true;
         }
     }
-    $walk($prompt);
+    if ($any) {
+        $walk($prompt);   // the person's own figures (a salary to test), but only alongside the books: never on their own
+    }
     $sources = array_values(array_unique($sources, SORT_REGULAR));
     $bad = [];
     foreach (agent_numbers_in($text) as $n) {
@@ -388,7 +397,7 @@ function agent_numbers_in(string $text): array
     $out = [];
     $months = 'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?';
     // Take dates out first.
-    $text = preg_replace_callback('/\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}\/\d{1,2}\/\d{2,4}\b|\b(?:' . $months . ')\.?\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?\b|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:' . $months . ')\b(?:,?\s+\d{4})?|\b(?:' . $months . ')\s+\d{4}\b|\b(?:19|20)\d{2}\b|\bQ[1-4]\b/i',
+    $text = preg_replace_callback('/\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b|\b(?:' . $months . ')\.?\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?\b|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:' . $months . ')\b(?:,?\s+\d{4})?|\b(?:' . $months . ')\s+\d{4}\b|\bQ[1-4]\b/i',
         fn() => ' ', $text);
     preg_match_all('/(-|−)?(\$)?\s?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?\s?(k|m|million|thousand)?\b(%|(?:st|nd|rd|th)\b)?/i', $text, $m, PREG_SET_ORDER);
     foreach ($m as $g) {
@@ -404,7 +413,9 @@ function agent_numbers_in(string $text): array
         }
         $tail = strtolower($g[6] ?? '');
         $ordinal = in_array($tail, ['st', 'nd', 'rd', 'th'], true);
-        $trivial = $ordinal || ($g[2] === '' && $tail !== '%' && $frac === '' && $scale === 1 && abs($value) <= 12);
+        $plain = $g[2] === '' && $tail !== '%' && $frac === '' && $scale === 1 && !str_contains($g[3], ',');
+        // A bare year ("in 2026", "FY2025") is prose; "$2050" or "2,050" is money and is checked.
+        $trivial = $ordinal || ($plain && abs($value) <= 12) || ($plain && $value >= 1900 && $value <= 2099 && strlen($whole) === 4);
         $out[] = ['raw' => trim($g[0]), 'value' => $value, 'places' => $places, 'scale' => $scale, 'trivial' => $trivial];
     }
     return $out;

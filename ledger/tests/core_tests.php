@@ -781,6 +781,16 @@ function test_ledger_feasibility_verdicts_from_hand_worked_books(): void
     check_same('recommended', $r['verdict'], 'a small loan');
     check_same(5600000, $r['figures']['lowest_cash_90d_after'], 'the low point is today, before the loan arrives');
     check_same(6400000, end($r['forecast_after'])['cash_end'], 'cash after 90 days: 56,000 + 10,000 - 2,000');
+    // No cash in the books yet: an unaffordable hire stays not recommended (it is not softened to caution).
+    ['pdo' => $pdo2, 'book' => $b2] = ledger_test_book('feasible-nocash');
+    foreach (['04', '05', '06'] as $mo) {
+        lt_invoice($pdo2, $b2, "nc:$mo", "2026-$mo-01", [['revenue.services', 1000000]]);
+        ledger_document_issue($pdo2, $b2, ['kind' => 'payable', 'party' => 'vendor:land', 'ref' => "Rent $mo", 'issued_on' => "2026-$mo-01", 'source_key' => "ncb:$mo",
+            'lines' => [['account' => 'exp.rent', 'amount' => 300000]]]);
+    }
+    $r = ledger_feasibility($pdo2, $b2, $on, ['kind' => 'hire', 'annual_salary' => 9000000, 'starts_on' => '2026-08-01']);
+    check(null === $r['figures']['lowest_cash_90d_after'], 'no cash balance');
+    check_same('not_recommended', $r['verdict'], 'no cash balance does not soften a losing hire: ' . json_encode($r['reasons']));
     foreach ([['kind' => 'hire'], ['kind' => 'yacht'], ['kind' => 'one_time_purchase', 'amount' => -5]] as $bad) {
         try {
             ledger_feasibility($pdo, $b, $on, $bad);
