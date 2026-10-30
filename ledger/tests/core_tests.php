@@ -135,8 +135,8 @@ function test_ledger_accounts_parties_and_locked_periods(): void
     // An account with postings keeps what it is.
     check_refused(fn() => $pdo->exec("UPDATE ledger.accounts SET type = 'asset' WHERE id = $soft"), 'an account with postings changed type');
 
-    // Locked through January: nothing is dated in it, the engine posts on the first open day.
-    $pdo->exec("UPDATE ledger.books SET locked_through = '2026-01-31' WHERE id = $b");
+    // Locked through January (by a signed close): nothing is dated in it, the engine posts on the first open day.
+    ledger_close_period($pdo, $b, '2026-01-01', '2026-01-31', 'owner');
     $cash = ledger_account_id($pdo, $b, 'cash.operating');
     $rev  = ledger_account_id($pdo, $b, 'revenue.services');
     check_refused(function () use ($pdo, $b, $cash, $rev) {
@@ -633,4 +633,22 @@ function test_ledger_partnership_year_end_splits_by_share(): void
     check_same(100001, $eq['totals']['closing'], 'equity after the split');
     check(in_array('Ana', array_column($eq['rows'], 'owner'), true), 'the equity statement does not show each partner');
     check_same([], ledger_tie_outs($pdo, $b, 'accrual', '2025-01-01', '2025-12-31'), 'tie-outs after the split');
+}
+
+
+function test_ledger_review_fixes_hold(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('review');
+    ledger_post($pdo, $b, ['entry_on' => '2026-01-05', 'lines' => [['account' => 'cash.operating', 'debit' => 100], ['account' => 'revenue.services', 'credit' => 100]]]);
+    $cash = ledger_account_id($pdo, $b, 'cash.operating');
+    check_refused(fn() => $pdo->exec("UPDATE ledger.accounts SET cash_flow_class = 'operating' WHERE id = $cash"), 'a posted account changed its cash flow class');
+    $pdo->exec("UPDATE ledger.accounts SET name = 'Checking' WHERE id = $cash");   // a rename is fine
+    $doc = ledger_document_issue($pdo, $b, ['kind' => 'receivable', 'party' => 'c:1', 'ref' => 'I1', 'issued_on' => '2026-02-01', 'source_key' => 'i1', 'lines' => [['account' => 'revenue.services', 'amount' => 5000]]]);
+    $s = ledger_settle($pdo, $b, $doc, ['settled_on' => '2026-02-10', 'amount' => 5000, 'source_key' => 'p1']);
+    check_refused(fn() => $pdo->exec("UPDATE ledger.settlements SET reversed_at = now(), reverse_reason = 'direct' WHERE id = $s"), 'a payment was marked reversed without reversing its entries');
+    ledger_settlement_reverse($pdo, $b, $s, '2026-02-11', 'tester', 'bounced');   // the proper way still works
+    check_same(5000, ledger_document_open($pdo, $doc), 'the proper reversal');
+    check_refused(fn() => $pdo->exec("UPDATE ledger.books SET locked_through = '2030-01-01' WHERE id = $b"), 'the lock moved without a close');
+    ledger_close_period($pdo, $b, '2026-01-01', '2026-01-31', 'owner');   // and the proper close still locks
+    check_same('2026-01-31', (string) $pdo->query("SELECT locked_through FROM ledger.books WHERE id = $b")->fetchColumn(), 'the close did not lock');
 }

@@ -282,8 +282,8 @@ BEGIN
     IF NEW.book_id <> OLD.book_id OR NEW.tenant_id <> OLD.tenant_id OR NEW.system_key IS DISTINCT FROM OLD.system_key THEN
         RAISE EXCEPTION 'an account stays in its book under its key';
     END IF;
-    IF (NEW.type, NEW.contra, NEW.control, NEW.accrual_only, NEW.equity_type, NEW.owner_party)
-       IS DISTINCT FROM (OLD.type, OLD.contra, OLD.control, OLD.accrual_only, OLD.equity_type, OLD.owner_party)
+    IF (NEW.type, NEW.contra, NEW.control, NEW.accrual_only, NEW.equity_type, NEW.owner_party, NEW.cash_flow_class)
+       IS DISTINCT FROM (OLD.type, OLD.contra, OLD.control, OLD.accrual_only, OLD.equity_type, OLD.owner_party, OLD.cash_flow_class)
        AND (EXISTS (SELECT 1 FROM ledger.lines WHERE account_id = OLD.id)
             OR EXISTS (SELECT 1 FROM ledger.document_lines WHERE account_id = OLD.id)) THEN
         RAISE EXCEPTION 'an account with postings keeps its type and behaviour; open a new account instead';
@@ -477,8 +477,16 @@ BEGIN
        OR (OLD.reversed_at IS NOT NULL AND (NEW.reversed_at IS DISTINCT FROM OLD.reversed_at OR NEW.reverse_reason <> OLD.reverse_reason)) THEN
         RAISE EXCEPTION 'a payment keeps what it was recorded with';
     END IF;
-    IF OLD.reversed_at IS NULL AND NEW.reversed_at IS NOT NULL AND length(NEW.reverse_reason) < 3 THEN
-        RAISE EXCEPTION 'a payment is reversed with a reason';
+    IF OLD.reversed_at IS NULL AND NEW.reversed_at IS NOT NULL THEN
+        IF length(NEW.reverse_reason) < 3 THEN
+            RAISE EXCEPTION 'a payment is reversed with a reason';
+        END IF;
+        -- The journal first: each of its entries must already carry a reversal.
+        IF (OLD.accrual_entry_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger.entries r WHERE r.reverses_id = OLD.accrual_entry_id))
+           OR (OLD.cash_entry_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger.entries r WHERE r.reverses_id = OLD.cash_entry_id))
+           OR (OLD.assign_entry_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger.entries r WHERE r.reverses_id = OLD.assign_entry_id)) THEN
+            RAISE EXCEPTION 'a payment is marked reversed only once its journal entries are reversed';
+        END IF;
     END IF;
     RETURN NEW;
 END $$;

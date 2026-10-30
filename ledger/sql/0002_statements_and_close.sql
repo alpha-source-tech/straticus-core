@@ -58,3 +58,23 @@ CREATE POLICY tenant ON ledger.closes USING (ledger.tenant_ok(tenant_id)) WITH C
 GRANT SELECT, INSERT ON ledger.closes TO {{APP_ROLE}};
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA ledger TO {{APP_ROLE}};
 GRANT EXECUTE ON FUNCTION ledger.guard_closes() TO {{APP_ROLE}};
+
+-- The lock date advances only with a close signed in the same transaction
+-- (ledger_close_period); never by a bare update, which could shut the books.
+CREATE OR REPLACE FUNCTION ledger.guard_books() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF ledger.is_system() THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+        RAISE EXCEPTION 'books stay with their tenant';
+    END IF;
+    IF OLD.locked_through IS NOT NULL AND (NEW.locked_through IS NULL OR NEW.locked_through < OLD.locked_through) THEN
+        RAISE EXCEPTION 'a locked period is unlocked only by trusted code, with a reason on record';
+    END IF;
+    IF NEW.locked_through IS DISTINCT FROM OLD.locked_through
+       AND NOT EXISTS (SELECT 1 FROM ledger.closes c WHERE c.book_id = OLD.id AND c.kind = 'close' AND c.period_end = NEW.locked_through AND c.created_at = now()) THEN
+        RAISE EXCEPTION 'the books lock only when a period is signed off';
+    END IF;
+    RETURN NEW;
+END $$;
