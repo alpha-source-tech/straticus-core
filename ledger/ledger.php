@@ -895,3 +895,5 @@ function ledger_fingerprint(PDO $pdo, int $bookId, ?string $through = null): str
     }
     return hash_final($h);
 }
+
+require_once __DIR__ . '/statements.php';

@@ -332,3 +332,122 @@ function test_ledger_tenants_see_only_their_own_books(): void
     });
     check_same(0, $seen, 'another tenant saw or wrote these books');
 }
+
+/**
+ * A small business over January and February, with every figure worked by
+ * hand: $10,000 put in, $3,000 of equipment, a $5,000 invoice (January),
+ * $2,000 paid on it (February), an $800 bill (January) paid in February,
+ * $100 of depreciation and a $500 draw (February), and $1,000 of someone
+ * else's money held in a restricted account.
+ */
+function lt_small_business(): array
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('statements');
+    ledger_account_ensure($pdo, $b, ['1060', 'Held for others', 'asset', 'Restricted cash: client trust', 'restricted_cash', ['key' => 't.held_cash']]);
+    ledger_account_ensure($pdo, $b, ['2550', 'Funds held for others', 'liability', 'Other current liabilities', 'operating', ['key' => 't.held', 'control' => 'trust_liability']]);
+    $post = fn(string $on, array $lines, string $memo = '') => ledger_post($pdo, $b, ['entry_on' => $on, 'memo' => $memo, 'lines' => $lines]);
+    $post('2026-01-02', [['account' => 'cash.operating', 'debit' => 1000000], ['account' => 'equity.capital', 'credit' => 1000000]], 'Owner puts in $10,000');
+    $post('2026-01-05', [['account' => 'fixed.equipment', 'debit' => 300000], ['account' => 'cash.operating', 'credit' => 300000]], 'Equipment');
+    $post('2026-01-06', [['account' => 't.held_cash', 'debit' => 100000], ['account' => 't.held', 'credit' => 100000, 'party' => 'client:9']], 'Held');
+    $inv = lt_invoice($pdo, $b, 'inv:sb', '2026-01-15', [['revenue.services', 500000, 'Consulting']]);
+    $bill = ledger_document_issue($pdo, $b, ['kind' => 'payable', 'party' => 'vendor:1', 'ref' => 'Bill 1', 'issued_on' => '2026-01-20', 'source_key' => 'bill:sb',
+        'lines' => [['account' => 'exp.office', 'amount' => 80000, 'memo' => 'Supplies']]]);
+    $pay = ledger_settle($pdo, $b, $inv, ['settled_on' => '2026-02-10', 'amount' => 200000, 'source_key' => 'pay:sb']);
+    ledger_settlement_assign($pdo, $b, $pay, [lt_line_ids($pdo, $inv)[0] => 200000], 'tester');
+    ledger_settle($pdo, $b, $bill, ['settled_on' => '2026-02-12', 'amount' => 80000, 'source_key' => 'billpay:sb']);
+    $post('2026-02-28', [['account' => 'exp.depreciation', 'debit' => 10000], ['account' => 'fixed.accum_depr', 'credit' => 10000]], 'Depreciation');
+    $post('2026-02-20', [['account' => 'equity.draws', 'debit' => 50000], ['account' => 'cash.operating', 'credit' => 50000]], 'Draw');
+    return ['pdo' => $pdo, 'book' => $b];
+}
+
+function test_ledger_statements_agree_on_both_bases(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = lt_small_business();
+    // Profit and loss.
+    $jan = ledger_profit_and_loss($pdo, $b, 'accrual', '2026-01-01', '2026-01-31');
+    check_same([500000, 80000, 420000], [$jan['sections']['revenue']['total'], $jan['sections']['opex']['total'], $jan['net_income']], 'January accrual P&L');
+    $feb = ledger_profit_and_loss($pdo, $b, 'accrual', '2026-02-01', '2026-02-28');
+    check_same(-10000, $feb['net_income'], 'February accrual net income');
+    $janCash = ledger_profit_and_loss($pdo, $b, 'cash', '2026-01-01', '2026-01-31');
+    check_same(0, $janCash['net_income'], 'nothing was paid in January');
+    $febCash = ledger_profit_and_loss($pdo, $b, 'cash', '2026-02-01', '2026-02-28');
+    check_same([200000, 90000, 110000], [$febCash['sections']['revenue']['total'], $febCash['sections']['opex']['total'], $febCash['net_income']], 'February cash P&L');
+
+    // Balance sheet at the end of February, accrual.
+    $bs = ledger_balance_sheet($pdo, $b, 'accrual', '2026-02-28');
+    check($bs['balanced'], 'the balance sheet does not balance');
+    check_same([1460000, 100000, 1360000, 410000], [$bs['total_assets'], $bs['total_liabilities'], $bs['total_equity'], $bs['current_year_earnings']], 'balance sheet totals');
+    // Cash basis: no receivable or payable, and the same cash.
+    $bsCash = ledger_balance_sheet($pdo, $b, 'cash', '2026-02-28');
+    check($bsCash['balanced'], 'the cash-basis balance sheet does not balance');
+    check_same(1160000, $bsCash['total_assets'], 'cash-basis assets: no receivable');
+
+    // Cash flow for February, accrual: -$100 + $2,000 receivable - $800 payable + $100 depreciation, then a $500 draw.
+    $cf = ledger_cash_flow($pdo, $b, 'accrual', '2026-02-01', '2026-02-28');
+    check_same([120000, 0, -50000, 70000], [$cf['operating']['total'], $cf['investing']['total'], $cf['financing']['total'], $cf['net_change']], 'February cash flow');
+    check_same(['cash' => 770000, 'restricted' => 100000, 'total' => 870000], $cf['closing'], 'closing cash, restricted shown apart');
+    check($cf['ties'], 'the cash flow does not tie');
+    $cfJan = ledger_cash_flow($pdo, $b, 'accrual', '2026-01-01', '2026-01-31');
+    check_same([-300000, 1000000], [$cfJan['investing']['total'], $cfJan['financing']['total']], 'January investing and financing');
+
+    // Owner's equity for February: $14,200 opening, $500 drawn, -$100 earned, $13,600 closing.
+    $eq = ledger_equity_statement($pdo, $b, 'accrual', '2026-02-01', '2026-02-28');
+    check_same([1420000, -50000, -10000, 1360000], [$eq['totals']['opening'], $eq['totals']['draws'], $eq['totals']['net_income'], $eq['totals']['closing']], 'equity statement');
+
+    foreach (['accrual', 'cash'] as $basis) {
+        foreach ([['2026-01-01', '2026-01-31'], ['2026-02-01', '2026-02-28'], ['2026-01-01', '2026-02-28']] as [$f, $t]) {
+            check_same([], ledger_tie_outs($pdo, $b, $basis, $f, $t), "tie-outs, $basis, $f to $t");
+        }
+    }
+
+    // Comparisons: February against January, with the change and percentage.
+    $cmp = ledger_profit_and_loss_compared($pdo, $b, 'accrual', '2026-02-01', '2026-02-28');
+    check_same(['2026-01-01', '2026-01-31'], $cmp['periods']['prior_period'], 'prior period of a month');
+    check_same(['2025-02-01', '2025-02-28'], $cmp['periods']['prior_year'], 'prior year');
+    $rev = $cmp['sections']['revenue']['rows'][0];
+    check_same([0, 500000, -500000, -100.0], [$rev['amount'], $rev['prior_period'], $rev['vs_prior_period']['change'], $rev['vs_prior_period']['pct']], 'revenue against January');
+    check_same(420000, $cmp['net_income_compared']['prior_period'], 'net income compared');
+}
+
+function test_ledger_close_signs_locks_and_verifies(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = lt_small_business();
+    $c = ledger_close_period($pdo, $b, '2026-01-01', '2026-01-31', 'owner:1', 'January reviewed');
+    check(ledger_close_verify($pdo, $b, $c), 'a fresh close does not verify');
+    check_same('2026-01-31', (string) $pdo->query("SELECT locked_through FROM ledger.books WHERE id = $b")->fetchColumn(), 'January is not locked');
+    // A late January item lands in February, and January's signed set still stands.
+    $e = ledger_post($pdo, $b, ['entry_on' => '2026-01-29', 'lines' => [['account' => 'exp.software', 'debit' => 1500], ['account' => 'cash.operating', 'credit' => 1500]]]);
+    check_same('2026-02-01', (string) $pdo->query("SELECT entry_on FROM ledger.entries WHERE id = $e")->fetchColumn(), 'a late entry was dated into a closed month');
+    check(ledger_close_verify($pdo, $b, $c), 'January stopped verifying after a February entry');
+    // Periods close in order, once.
+    foreach ([['2026-01-01', '2026-01-31'], ['2026-03-01', '2026-03-31']] as [$f, $t]) {
+        try {
+            ledger_close_period($pdo, $b, $f, $t, 'owner:1');
+            check(false, "a close of $f to $t was accepted");
+        } catch (LedgerError) {
+        }
+    }
+    check_refused(fn() => $pdo->exec("UPDATE ledger.closes SET note = 'edited' WHERE id = $c"), 'a signed close was edited');
+    check_refused(fn() => $pdo->exec("DELETE FROM ledger.closes WHERE id = $c"), 'a signed close was deleted');
+    // Unlocking is trusted code only.
+    try {
+        ledger_unlock($pdo, $b, null, 'owner:1', 'want to change January');
+        check(false, 'a tenant unlocked a closed period');
+    } catch (LedgerError) {
+    }
+    check_same(1, count(ledger_closes($pdo, $b)), 'the closes list');
+}
+
+function test_ledger_earlier_years_and_current_year_earnings(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('fiscal');
+    ledger_post($pdo, $b, ['entry_on' => '2025-12-15', 'lines' => [['account' => 'cash.operating', 'debit' => 30000], ['account' => 'revenue.services', 'credit' => 30000]]]);
+    ledger_post($pdo, $b, ['entry_on' => '2026-01-15', 'lines' => [['account' => 'cash.operating', 'debit' => 7000], ['account' => 'revenue.services', 'credit' => 7000]]]);
+    $bs = ledger_balance_sheet($pdo, $b, 'accrual', '2026-01-31');
+    check_same(7000, $bs['current_year_earnings'], 'current-year earnings from January');
+    check_same(37000, $bs['total_equity'], 'earlier earnings carried in equity');
+    check($bs['balanced'], 'the balance sheet does not balance across the year end');
+    // A fiscal year starting in July: December and January are the same year.
+    $pdo->exec("UPDATE ledger.books SET fiscal_year_start = 7 WHERE id = $b");
+    check_same(37000, ledger_balance_sheet($pdo, $b, 'accrual', '2026-01-31')['current_year_earnings'], 'July fiscal year');
+}
