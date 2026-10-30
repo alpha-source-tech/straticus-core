@@ -682,3 +682,110 @@ function test_ledger_review_followups(): void
     check_same([5000, 0, 20000], [$eq['totals']['contributions'], $eq['totals']['allocated'], $eq['totals']['net_income']], 'equity totals');
     check_same([], ledger_tie_outs($pdo, $b, 'accrual', '2026-01-01', '2026-12-31'), 'tie-outs after the follow-ups');
 }
+
+/** Six months of a steady practice: $8,000 a month billed Jan–Mar, $10,000 Apr–Jun, each paid on the 20th; rent $3,000 on the 5th. */
+function lt_steady_practice(PDO $pdo, int $b): void
+{
+    ledger_post($pdo, $b, ['entry_on' => '2026-01-02', 'lines' => [['account' => 'cash.operating', 'debit' => 2000000], ['account' => 'equity.capital', 'credit' => 2000000]]]);
+    foreach (['01' => 800000, '02' => 800000, '03' => 800000, '04' => 1000000, '05' => 1000000, '06' => 1000000] as $mo => $fee) {
+        $doc = lt_invoice($pdo, $b, "inv:$mo", "2026-$mo-01", [['revenue.services', $fee]], 'client:' . ((int) $mo % 3 + 1));
+        ledger_settle($pdo, $b, $doc, ['settled_on' => "2026-$mo-20", 'amount' => $fee, 'source_key' => "pay:$mo"]);
+        ledger_post($pdo, $b, ['entry_on' => "2026-$mo-05", 'lines' => [['account' => 'exp.rent', 'debit' => 300000], ['account' => 'cash.operating', 'credit' => 300000]]]);
+    }
+}
+
+function test_ledger_health_findings_from_hand_worked_books(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('health-good');
+    lt_steady_practice($pdo, $b);
+    $p = ledger_financial_profile($pdo, $b, '2026-07-15');
+    check_same(6, $p['months_with_activity'], 'months with activity');
+    check_same(3000000, $p['revenue_3m'], 'revenue April to June');
+    check_same(900000, $p['expenses_3m'], 'expenses April to June');
+    check_same(70.0, $p['net_margin_pct'], 'net margin: 21,000 / 30,000');
+    check_same(25.0, $p['revenue_growth_pct'], 'revenue growth: 30,000 against 24,000');
+    check_same(0.0, $p['expense_growth_pct'], 'expenses flat');
+    check_same(5600000, $p['cash'], 'cash: 20,000 + 54,000 collected - 18,000 rent');
+    check_same(0, $p['monthly_cash_burn'], 'not burning cash');
+    check_same(null, $p['runway_months'], 'no runway when not burning');
+    check_same(18.7, $p['cash_cover_months'], 'cash covers 56,000 / 3,000 months of costs');
+    check_same(0, $p['ar']['total'], 'nothing owed');
+    check_same(3000000, $p['collected_90d'], 'collected April 20, May 20, June 20');
+    $f = ledger_findings($p, ['days_since_bank' => 10, 'days_since_close' => 10]);
+    check_same(['cash_buffer_ok', 'healthy_margin'], array_column($f, 'code'), 'a healthy practice gets only good findings');
+
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('health-bad');
+    // $5,000 billed on the 1st of April, May and June, due on the 15th; only June's is paid. Rent is $6,000.
+    ledger_post($pdo, $b, ['entry_on' => '2026-01-02', 'lines' => [['account' => 'cash.operating', 'debit' => 1500000], ['account' => 'equity.capital', 'credit' => 1500000]]]);
+    foreach (['04', '05', '06'] as $mo) {
+        $doc = ledger_document_issue($pdo, $b, ['kind' => 'receivable', 'party' => 'client:1', 'ref' => "Inv $mo", 'issued_on' => "2026-$mo-01", 'due_on' => "2026-$mo-15",
+            'source_key' => "inv:$mo", 'lines' => [['account' => 'revenue.services', 'amount' => 500000]]]);
+        if ($mo === '06') {
+            ledger_settle($pdo, $b, $doc, ['settled_on' => '2026-06-20', 'amount' => 500000, 'source_key' => 'pay:06']);
+        }
+        ledger_post($pdo, $b, ['entry_on' => "2026-$mo-05", 'lines' => [['account' => 'exp.rent', 'debit' => 600000], ['account' => 'cash.operating', 'credit' => 600000]]]);
+    }
+    $p = ledger_financial_profile($pdo, $b, '2026-07-15');
+    check_same(-300000, $p['net_3m'], 'lost $3,000 over the quarter');
+    check_same(200000, $p['cash'], 'cash: 15,000 + 5,000 - 18,000');
+    check_same(433333, $p['monthly_cash_burn'], 'cash burn: (6,000 + 6,000 + 1,000) / 3');
+    check_same(0.5, $p['runway_months'], 'runway: 2,000 / 4,333');
+    check_same(['current' => 0, '1_30' => 0, '31_60' => 0, '61_90' => 500000, 'over_90' => 500000, 'total' => 1000000], $p['ar'], 'aging: April 91 days late, May 61');
+    check_same(90, $p['dso_days'], 'DSO: 10,000 owed / (10,000 billed / 90 days)');
+    check_same(50.0, $p['collection_rate_pct'], 'collected 5,000 of 10,000 billed in 90 days');
+    $f = ledger_findings($p);
+    $codes = array_column($f, 'code');
+    foreach (['losing_money', 'cash_burn', 'old_receivables', 'slow_collections', 'low_collection_rate', 'bank_not_reconciled', 'period_not_closed'] as $c) {
+        check(in_array($c, $codes, true), "finding $c missing: " . json_encode($codes));
+    }
+    check_same('critical', $f[0]['severity'], 'most serious first');
+    check(!in_array('healthy_margin', $codes, true) && !in_array('cash_buffer_ok', $codes, true), 'no good news for a struggling practice');
+    $burn = $f[array_search('cash_burn', $codes, true)];
+    check_same('critical', $burn['severity'], 'under three months of runway is critical');
+    check(str_contains($burn['advice'], '$2,000.00') && str_contains($burn['advice'], '$10,000.00'), 'advice quotes the measured figures: ' . $burn['advice']);
+    $books = ledger_findings($p, ['tie_out_problems' => ['trust does not tie']]);
+    check_same('books_do_not_tie', $books[0]['code'], 'books that do not tie come first');
+
+    // Thin data says so, rather than judging a trend.
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('health-thin');
+    ledger_post($pdo, $b, ['entry_on' => '2026-06-02', 'lines' => [['account' => 'cash.operating', 'debit' => 100000], ['account' => 'equity.capital', 'credit' => 100000]]]);
+    $codes = array_column(ledger_findings(ledger_financial_profile($pdo, $b, '2026-07-15'), ['days_since_bank' => 1, 'days_since_close' => 1]), 'code');
+    check_same(['thin_data'], $codes, 'a new practice gets only the thin-data note');
+}
+
+function test_ledger_feasibility_verdicts_from_hand_worked_books(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('feasible');
+    lt_steady_practice($pdo, $b);
+    $on = '2026-07-15';
+    // A hire at $60,000 + 20% = $6,000 a month from August 1: payroll on Aug 15, Aug 31, Sep 15, Sep 30 in the 90 days.
+    $r = ledger_feasibility($pdo, $b, $on, ['kind' => 'hire', 'annual_salary' => 6000000, 'starts_on' => '2026-08-01']);
+    check_same('recommended', $r['verdict'], 'an affordable hire: ' . json_encode($r['reasons']));
+    check_same(-600000, $r['figures']['monthly_change'], 'hire cost a month');
+    check_same(100000, $r['figures']['avg_monthly_net_after'], 'net after: 7,000 - 6,000');
+    check_same(10.0, $r['figures']['net_margin_pct_after'], 'margin after: 1,000 / 10,000');
+    check_same(4400000, $r['figures']['lowest_cash_90d_after'], 'lowest cash: 56,000 - 4 x 3,000');
+    // At $90,000 the practice would lose money every month.
+    $r = ledger_feasibility($pdo, $b, $on, ['kind' => 'hire', 'annual_salary' => 9000000, 'starts_on' => '2026-08-01']);
+    check_same('not_recommended', $r['verdict'], 'an unaffordable hire');
+    check_same(-200000, $r['figures']['avg_monthly_net_after'], 'net after: 7,000 - 9,000');
+    // Purchases: one the cash covers with room, one that eats the buffer, one it cannot cover.
+    $buy = fn(int $c) => ledger_feasibility($pdo, $b, $on, ['kind' => 'one_time_purchase', 'amount' => $c, 'on' => '2026-08-01', 'name' => 'Server']);
+    check_same('recommended', $buy(5000000)['verdict'], 'leaves 6,000, over a month of costs');
+    check_same('caution', $buy(5400000)['verdict'], 'leaves 2,000, under a month of costs (3,000)');
+    $r = $buy(6000000);
+    check_same('not_recommended', $r['verdict'], 'cash would go negative');
+    check_same(-400000, $r['figures']['lowest_cash_90d_after'], 'lowest cash after the purchase');
+    // A loan: $10,000 in on July 20, $1,000 out on Aug 20 and Sep 20.
+    $r = ledger_feasibility($pdo, $b, $on, ['kind' => 'loan', 'principal' => 1000000, 'monthly_payment' => 100000, 'on' => '2026-07-20']);
+    check_same('recommended', $r['verdict'], 'a small loan');
+    check_same(5600000, $r['figures']['lowest_cash_90d_after'], 'the low point is today, before the loan arrives');
+    check_same(6400000, end($r['forecast_after'])['cash_end'], 'cash after 90 days: 56,000 + 10,000 - 2,000');
+    foreach ([['kind' => 'hire'], ['kind' => 'yacht'], ['kind' => 'one_time_purchase', 'amount' => -5]] as $bad) {
+        try {
+            ledger_feasibility($pdo, $b, $on, $bad);
+            check(false, 'an incomplete scenario was judged: ' . json_encode($bad));
+        } catch (LedgerError) {
+        }
+    }
+}

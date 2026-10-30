@@ -125,7 +125,12 @@ function ledger_cash_forecast(PDO $pdo, int $bookId, string $asOf, array $recurr
             continue;
         }
         $dates = [];
-        if (!empty($r['every_days']) && ledger_is_date((string) ($r['next_on'] ?? ''))) {
+        $from = ledger_is_date((string) ($r['from'] ?? '')) ? (string) $r['from'] : $asOf;   // a cost that starts later
+        if (ledger_is_date((string) ($r['once_on'] ?? ''))) {
+            if ($r['once_on'] >= $asOf && $r['once_on'] <= $end(90)) {
+                $dates[] = (string) $r['once_on'];   // a one-time amount
+            }
+        } elseif (!empty($r['every_days']) && ledger_is_date((string) ($r['next_on'] ?? ''))) {
             for ($d = (string) $r['next_on']; $d <= $end(90); $d = gmdate('Y-m-d', strtotime($d . ' +' . (int) $r['every_days'] . ' days'))) {
                 if ($d >= $asOf) {
                     $dates[] = $d;
@@ -140,11 +145,15 @@ function ledger_cash_forecast(PDO $pdo, int $bookId, string $asOf, array $recurr
                 }
             }
         }
+        $dir = ($r['direction'] ?? 'out') === 'in' ? 'in' : 'out';   // money coming in (a loan's proceeds), or going out
         foreach ($dates as $d) {
+            if ($d < $from) {
+                continue;
+            }
             $i = $windowOf($d);
-            $items[] = ['kind' => 'out', 'ref' => (string) ($r['name'] ?? 'Recurring'), 'party' => '', 'amount' => $amt, 'due_on' => $d, 'expected_on' => $d, 'window' => $i];
+            $items[] = ['kind' => $dir, 'ref' => (string) ($r['name'] ?? 'Recurring'), 'party' => '', 'amount' => $amt, 'due_on' => $d, 'expected_on' => $d, 'window' => $i, 'band' => 0];
             if ($i !== null) {
-                $windows[$i]['out'] += $amt;
+                $windows[$i][$dir] += $amt;
             }
         }
     }
@@ -170,14 +179,23 @@ function ledger_cash_forecast(PDO $pdo, int $bookId, string $asOf, array $recurr
     unset($w);
     // The biggest single outflow in a window that the low band cannot cover before it lands.
     usort($items, fn($a, $b) => [$a['expected_on'], $a['kind']] <=> [$b['expected_on'], $b['kind']]);
+    $lowest = null;   // the lowest cash on hand on any day, on the low band
     if ($openingKnown) {
         $pos = $cash;
+        $lowest = ['amount' => $cash, 'on' => $asOf];
+        $flagged = false;
         foreach ($items as $it) {
+            if ($it['window'] === null) {
+                continue;
+            }
             $pos += $it['kind'] === 'in' ? (int) round($it['amount'] * (1 - ($it['band'] ?? 0) / 100)) : -$it['amount'];
-            if ($it['kind'] === 'out' && $pos < 0) {
+            if ($pos < $lowest['amount']) {
+                $lowest = ['amount' => $pos, 'on' => $it['expected_on']];
+            }
+            if (!$flagged && $it['kind'] === 'out' && $pos < 0) {
+                $flagged = true;
                 $risks[] = ['severity' => $it['amount'], 'kind' => 'payment_at_risk',
                             'text' => sprintf('%s of %s on %s: on the low band, cash on hand would be %s that day.', $it['ref'], ledger_money($it['amount']), $it['expected_on'], ledger_money($pos))];
-                break;
             }
         }
     }
@@ -191,7 +209,7 @@ function ledger_cash_forecast(PDO $pdo, int $bookId, string $asOf, array $recurr
     }
     usort($risks, fn($a, $b) => $b['severity'] <=> $a['severity']);
     return [
-        'as_of' => $asOf, 'opening' => $openingKnown ? $cash : null, 'opening_as_of' => $lastCash, 'windows' => $windows,
+        'as_of' => $asOf, 'opening' => $openingKnown ? $cash : null, 'opening_as_of' => $lastCash, 'windows' => $windows, 'lowest' => $lowest,
         'items' => $items, 'risks' => array_slice($risks, 0, 5),
     ];
 }

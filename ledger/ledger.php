@@ -903,3 +903,4 @@ require_once __DIR__ . '/statements.php';
 require_once __DIR__ . '/assets.php';
 require_once __DIR__ . '/forecast.php';
 require_once __DIR__ . '/bank.php';
+require_once __DIR__ . '/analysis.php';
