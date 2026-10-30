@@ -73,6 +73,29 @@ function ledger_activity(PDO $pdo, int $bookId, string $basis, ?string $from, st
     if (!in_array($basis, ['accrual', 'cash'], true)) {
         throw new LedgerError('A basis is accrual or cash.');
     }
+    // A statement page asks for the same activity many times: cache it for
+    // this request, keyed on the newest entry so any posting starts afresh.
+    $v = $pdo->prepare('SELECT coalesce(MAX(id), 0) FROM ledger.entries WHERE book_id = :b');
+    $v->execute(['b' => $bookId]);
+    $ck = implode('|', [spl_object_id($pdo), $bookId, $basis, $from ?? '', $to, $excludeClosing ? 1 : 0, (int) $v->fetchColumn(), $GLOBALS['ledger_cache_epoch'] ?? 0]);
+    static $cache = [];
+    if (isset($cache[$ck])) {
+        return $cache[$ck];
+    }
+    if (count($cache) > 200) {
+        $cache = [];
+    }
+    return $cache[$ck] = ledger_activity_query($pdo, $bookId, $basis, $from, $to, $excludeClosing);
+}
+
+/** Forget cached activity (an account was renamed or re-tagged). */
+function ledger_cache_clear(): void
+{
+    $GLOBALS['ledger_cache_epoch'] = ($GLOBALS['ledger_cache_epoch'] ?? 0) + 1;
+}
+
+function ledger_activity_query(PDO $pdo, int $bookId, string $basis, ?string $from, string $to, bool $excludeClosing): array
+{
     $q = $pdo->prepare("SELECT a.id, a.code, a.name, a.type, a.contra, a.statement_line, a.cash_flow_class, a.equity_type,
                                a.owner_party, a.control, a.system_key, a.active,
                                SUM(l.debit_cents - l.credit_cents) AS net
@@ -296,13 +319,20 @@ function ledger_equity_statement(PDO $pdo, int $bookId, string $basis, string $f
 {
     $openActs = ledger_activity($pdo, $bookId, $basis, null, ledger_day_before($from));
     $moves = ledger_activity($pdo, $bookId, $basis, $from, $to);
+    // What a year-end close moved into each equity account in the period.
+    $q = $pdo->prepare("SELECT l.account_id, SUM(l.credit_cents - l.debit_cents) FROM ledger.lines l JOIN ledger.entries e ON e.id = l.entry_id
+                         WHERE l.book_id = :b AND e.event_type = 'period.year_end' AND e.basis IN ('both', :basis)
+                           AND e.entry_on BETWEEN CAST(:f AS date) AND CAST(:t AS date) GROUP BY l.account_id");
+    $q->execute(['b' => $bookId, 'basis' => $basis, 'f' => $from, 't' => $to]);
+    $allocated = array_map('intval', $q->fetchAll(PDO::FETCH_KEY_PAIR));
     $rows = [];
     foreach ($openActs + $moves as $id => $a) {
         if ($a['type'] !== 'equity') {
             continue;
         }
         $open = -($openActs[$id]['net'] ?? 0);
-        $move = -($moves[$id]['net'] ?? 0);
+        $alloc = $allocated[$id] ?? 0;
+        $move = -($moves[$id]['net'] ?? 0) - $alloc;
         $kind = match ($a['equity_type']) {
             'contributions', 'capital', 'stock', 'paid_in_capital' => 'contributions',
             'draws', 'distributions'                               => 'draws',
@@ -311,7 +341,7 @@ function ledger_equity_statement(PDO $pdo, int $bookId, string $basis, string $f
         $rows[] = ['account_id' => (int) $id, 'code' => $a['code'], 'name' => $a['name'], 'owner' => $a['owner_party'],
                    'opening' => $open, 'contributions' => $kind === 'contributions' ? $move : 0,
                    'draws' => $kind === 'draws' ? $move : 0, 'other' => $kind === 'other' ? $move : 0,
-                   'net_income' => 0, 'closing' => $open + $move];
+                   'net_income' => 0, 'allocated' => $alloc, 'closing' => $open + $move + $alloc];
     }
     usort($rows, fn($x, $y) => strcmp($x['code'], $y['code']));
     // Earnings: everything before this period's start that is not yet in an
@@ -321,8 +351,8 @@ function ledger_equity_statement(PDO $pdo, int $bookId, string $basis, string $f
     $ni = ledger_net_income($pdo, $bookId, $basis, $from, $to, true);
     $closed = $ni - ledger_net_income($pdo, $bookId, $basis, $from, $to);   // moved into an equity account by a year-end close
     $rows[] = ['account_id' => null, 'code' => '', 'name' => 'Earnings not yet closed', 'owner' => '',
-               'opening' => $earlierOpen, 'contributions' => 0, 'draws' => 0, 'other' => -$closed, 'net_income' => $ni, 'closing' => $earlierOpen + $ni - $closed];
-    $tot = ['opening' => 0, 'contributions' => 0, 'draws' => 0, 'other' => 0, 'net_income' => 0, 'closing' => 0];
+               'opening' => $earlierOpen, 'contributions' => 0, 'draws' => 0, 'other' => 0, 'net_income' => $ni, 'allocated' => -$closed, 'closing' => $earlierOpen + $ni - $closed];
+    $tot = ['opening' => 0, 'contributions' => 0, 'draws' => 0, 'other' => 0, 'net_income' => 0, 'allocated' => 0, 'closing' => 0];
     foreach ($rows as $r) {
         foreach ($tot as $k => $_) {
             $tot[$k] += $r[$k];
@@ -499,8 +529,23 @@ function ledger_statement_set(PDO $pdo, int $bookId, string $basis, string $from
         'equity' => ledger_equity_statement($pdo, $bookId, $basis, $from, $to),
         'trial_balance' => ledger_trial_balance($pdo, $bookId, $basis, $to),
     ];
-    $set['sha256'] = hash('sha256', json_encode($set, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    // The fingerprint covers figures and which account they belong to, not
+    // names or codes: renaming an account must not break a signed close.
+    $set['sha256'] = hash('sha256', json_encode(ledger_figures_only($set), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
     return $set;
+}
+
+/** A statement set with every presentation field (names, codes, labels) removed. */
+function ledger_figures_only(array $a): array
+{
+    $out = [];
+    foreach ($a as $k => $v) {
+        if (in_array($k, ['name', 'code', 'label', 'line', 'owner', 'system_key', 'active'], true)) {
+            continue;
+        }
+        $out[$k] = is_array($v) ? ledger_figures_only($v) : $v;
+    }
+    return $out;
 }
 
 /* ── Period close ────────────────────────────────────────────────────── */

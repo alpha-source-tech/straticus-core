@@ -186,6 +186,7 @@ function ledger_account_ensure(PDO $pdo, int $bookId, array $spec): int
             return (int) $id;
         }
     }
+    ledger_cache_clear();
     $code = ledger_free_code($pdo, $bookId, (string) $code);
     $q = $pdo->prepare('INSERT INTO ledger.accounts (book_id, code, name, type, contra, statement_line, cash_flow_class, equity_type,
                                                      owner_party, accrual_only, control, system_key)

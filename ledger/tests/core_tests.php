@@ -652,3 +652,33 @@ function test_ledger_review_fixes_hold(): void
     ledger_close_period($pdo, $b, '2026-01-01', '2026-01-31', 'owner');   // and the proper close still locks
     check_same('2026-01-31', (string) $pdo->query("SELECT locked_through FROM ledger.books WHERE id = $b")->fetchColumn(), 'the close did not lock');
 }
+
+function test_ledger_review_followups(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('followups');
+    // Accrual-only accounts take accrual-basis lines only.
+    try {
+        ledger_post($pdo, $b, ['entry_on' => '2026-01-31', 'basis' => 'both', 'lines' => [['account' => 'exp.rent', 'debit' => 100], ['account' => 'accrued', 'credit' => 100]]]);
+        check(false, 'an accrual was posted on both bases');
+    } catch (LedgerError $e) {
+        check(str_contains($e->getMessage(), 'accrual'), 'wrong refusal: ' . $e->getMessage());
+    }
+    ledger_post($pdo, $b, ['entry_on' => '2026-01-31', 'basis' => 'accrual', 'lines' => [['account' => 'exp.rent', 'debit' => 100], ['account' => 'accrued', 'credit' => 100]]]);
+    ledger_post($pdo, $b, ['entry_on' => '2026-01-02', 'lines' => [['account' => 'cash.operating', 'debit' => 5000], ['account' => 'equity.capital', 'credit' => 5000]]]);
+    // Renaming an account does not break a signed close.
+    $c = ledger_close_period($pdo, $b, '2026-01-01', '2026-01-31', 'owner');
+    $rent = ledger_account_id($pdo, $b, 'exp.rent');
+    $pdo->exec("UPDATE ledger.accounts SET name = 'Office rent', code = '6105' WHERE id = $rent");
+    ledger_cache_clear();
+    check(ledger_close_verify($pdo, $b, $c), 'a rename broke a signed close');
+    // A partnership's year-end allocation has its own column; "put in" stays for money put in.
+    ledger_book_set_entity($pdo, $b, 'pllc', 'partnership');
+    ledger_profit_shares_set($pdo, $b, '2026-01-01', ['Ana' => '50', 'Ben' => '50'], 'owner');
+    ledger_post($pdo, $b, ['entry_on' => '2026-06-01', 'lines' => [['account' => 'cash.operating', 'debit' => 20100], ['account' => 'revenue.services', 'credit' => 20100]]]);
+    ledger_year_end_close($pdo, $b, '2026-12-31', 'owner');
+    $eq = ledger_equity_statement($pdo, $b, 'accrual', '2026-01-01', '2026-12-31');
+    $ana = array_values(array_filter($eq['rows'], fn($r) => $r['owner'] === 'Ana'))[0];
+    check_same([0, 10000], [$ana['contributions'], $ana['allocated']], 'Ana\'s allocation shown as money put in');
+    check_same([5000, 0, 20000], [$eq['totals']['contributions'], $eq['totals']['allocated'], $eq['totals']['net_income']], 'equity totals');
+    check_same([], ledger_tie_outs($pdo, $b, 'accrual', '2026-01-01', '2026-12-31'), 'tie-outs after the follow-ups');
+}
