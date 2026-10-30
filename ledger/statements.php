@@ -532,6 +532,9 @@ function ledger_close_period(PDO $pdo, int $bookId, string $from, string $to, st
                 $problems[] = ucfirst($basis) . ': ' . $pr;
             }
         }
+        if (function_exists('ledger_assets_behind') && ($behind = ledger_assets_behind($pdo, $bookId, $to))) {
+            $problems[] = 'Depreciation is not posted through ' . $to . ' for: ' . implode(', ', $behind) . '.';
+        }
         if ($problems) {
             throw new LedgerError('The period cannot be signed: ' . implode(' ', $problems));
         }

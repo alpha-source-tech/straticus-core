@@ -451,3 +451,61 @@ function test_ledger_earlier_years_and_current_year_earnings(): void
     $pdo->exec("UPDATE ledger.books SET fiscal_year_start = 7 WHERE id = $b");
     check_same(37000, ledger_balance_sheet($pdo, $b, 'accrual', '2026-01-31')['current_year_earnings'], 'July fiscal year');
 }
+
+function test_ledger_fixed_assets_depreciate_change_and_dispose(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('assets');
+    ledger_post($pdo, $b, ['entry_on' => '2026-01-01', 'lines' => [['account' => 'cash.operating', 'debit' => 1000000], ['account' => 'equity.capital', 'credit' => 1000000]]]);
+    // $3,600 over 36 months, no salvage: $100 a month from January.
+    $id = ledger_asset_add($pdo, $b, ['name' => 'Copier', 'cost' => 360000, 'in_service_on' => '2026-01-15', 'life_months' => 36,
+        'source_key' => 'asset:copier', 'paid_from' => 'cash.operating']);
+    check_same($id, ledger_asset_add($pdo, $b, ['name' => 'Copier', 'cost' => 1, 'in_service_on' => '2026-01-15', 'life_months' => 1, 'source_key' => 'asset:copier']), 'an asset was added twice');
+    check_same(3, ledger_depreciate_through($pdo, $b, '2026-03-31'), 'three months posted');
+    check_same(0, ledger_depreciate_through($pdo, $b, '2026-03-31'), 'depreciation posted twice');
+    check_same(30000, ledger_balance($pdo, $b, 'exp.depreciation', 'cash'), 'depreciation counts on the cash basis too');
+    check_same(['Copier'], ledger_assets_behind($pdo, $b, '2026-04-30'), 'April is not flagged as behind');
+    // Change of estimate in April: life 24 months, $300 salvage. What is left ($3,300 - $300) spreads over the 21 months left.
+    $eff = ledger_asset_change($pdo, $b, $id, ['life_months' => 24, 'salvage' => 30000], 'Heavier use than expected', 'owner');
+    check_same('2026-04-01', $eff, 'the change does not apply from the next unposted month');
+    $sched = ledger_asset_schedule($pdo, ledger_asset($pdo, $b, $id));
+    check_same(21, count($sched), 'months left after the change');
+    check_same(300000, array_sum($sched), 'what is left to depreciate after the change');
+    check_same(30000, ledger_balance($pdo, $b, 'exp.depreciation', 'accrual', '2026-03-31'), 'posted months moved');
+    check_refused(fn() => $pdo->exec("UPDATE ledger.assets SET life_months = 12 WHERE id = $id"), 'a schedule changed without a recorded change');
+    check_refused(fn() => $pdo->exec("UPDATE ledger.assets SET cost_cents = 1 WHERE id = $id"), 'an asset cost changed');
+    try {
+        ledger_asset_change($pdo, $b, $id, ['life_months' => 3], 'too short', 'owner');
+        check(false, 'a life shorter than what was already depreciated');
+    } catch (LedgerError) {
+    }
+    // A close needs depreciation posted through its end.
+    try {
+        ledger_close_period($pdo, $b, '2026-01-01', '2026-04-30', 'owner');
+        check(false, 'a close went ahead with depreciation missing');
+    } catch (LedgerError $e) {
+        check(str_contains($e->getMessage(), 'Depreciation'), 'the close refused for another reason: ' . $e->getMessage());
+    }
+    // Sold in July for $2,500: April to June depreciated first ($3,000 / 21 = 142.86 a month).
+    ledger_asset_dispose($pdo, $b, $id, '2026-07-10', 250000, 'cash.operating', 'owner');
+    $a = ledger_asset($pdo, $b, $id);
+    [$accum] = ledger_asset_posted($pdo, $a);
+    check_same(30000 + 3 * 14286, $accum, 'depreciation through June');
+    $bookValue = 360000 - $accum;
+    check_same($bookValue - 250000, ledger_balance($pdo, $b, 'exp.disposal_loss', 'accrual'), 'the loss on disposal');
+    check_same(0, ledger_balance($pdo, $b, 'fixed.equipment', 'accrual') + ledger_balance($pdo, $b, 'fixed.accum_depr', 'accrual'), 'the asset is still on the books');
+    check_same([], ledger_tie_outs($pdo, $b, 'accrual', '2026-01-01', '2026-07-31'), 'tie-outs with assets');
+    check_same([], ledger_tie_outs($pdo, $b, 'cash', '2026-01-01', '2026-07-31'), 'cash tie-outs with assets');
+    $reg = ledger_asset_register($pdo, $b);
+    check_same([1, '2026-07-10', 1], [count($reg), (string) $reg[0]['disposed_on'], count($reg[0]['changes'])], 'the register');
+}
+
+function test_ledger_declining_balance_lands_on_salvage(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('ddb');
+    $id = ledger_asset_add($pdo, $b, ['name' => 'Laptops', 'cost' => 500000, 'salvage' => 50000, 'in_service_on' => '2025-01-01', 'life_months' => 36,
+        'method' => 'declining_balance', 'source_key' => 'asset:laptops', 'paid_from' => 'cash.operating']);
+    $sched = ledger_asset_schedule($pdo, ledger_asset($pdo, $b, $id));
+    check_same(36, count($sched), 'a declining-balance schedule runs the full life');
+    check_same(450000, array_sum($sched), 'declining balance stops at salvage');
+    check(reset($sched) > end($sched), 'declining balance does not decline');
+}
