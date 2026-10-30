@@ -68,7 +68,7 @@ function ledger_pl_section(array $a): string
  * means since the beginning). Each row: the account and its debit-positive
  * net movement. Accounts with no lines are left out.
  */
-function ledger_activity(PDO $pdo, int $bookId, string $basis, ?string $from, string $to): array
+function ledger_activity(PDO $pdo, int $bookId, string $basis, ?string $from, string $to, bool $excludeClosing = false): array
 {
     if (!in_array($basis, ['accrual', 'cash'], true)) {
         throw new LedgerError('A basis is accrual or cash.');
@@ -82,8 +82,9 @@ function ledger_activity(PDO $pdo, int $bookId, string $basis, ?string $from, st
                          WHERE l.book_id = :b AND e.basis IN ('both', :basis)
                            AND e.entry_on <= CAST(:to AS date)
                            AND (CAST(:from AS date) IS NULL OR e.entry_on >= CAST(:from2 AS date))
+                           AND (NOT CAST(:xc AS boolean) OR e.event_type <> 'period.year_end')
                          GROUP BY a.id ORDER BY a.code");
-    $q->execute(['b' => $bookId, 'basis' => $basis, 'to' => $to, 'from' => $from, 'from2' => $from]);
+    $q->execute(['b' => $bookId, 'basis' => $basis, 'to' => $to, 'from' => $from, 'from2' => $from, 'xc' => $excludeClosing ? 'true' : 'false']);
     $out = [];
     foreach ($q->fetchAll(PDO::FETCH_ASSOC) as $r) {
         $r['net'] = (int) $r['net'];
@@ -123,7 +124,7 @@ function ledger_profit_and_loss(PDO $pdo, int $bookId, string $basis, string $fr
     foreach (LEDGER_PL_SECTIONS as $k => $label) {
         $sections[$k] = ['key' => $k, 'label' => $label, 'rows' => [], 'total' => 0];
     }
-    foreach (ledger_activity($pdo, $bookId, $basis, $from, $to) as $a) {
+    foreach (ledger_activity($pdo, $bookId, $basis, $from, $to, true) as $a) {
         if (!in_array($a['type'], ['revenue', 'expense'], true) || $a['net'] === 0) {
             continue;
         }
@@ -145,10 +146,10 @@ function ledger_profit_and_loss(PDO $pdo, int $bookId, string $basis, string $fr
 }
 
 /** Net income for a period on a basis: credits less debits on revenue and expense accounts. */
-function ledger_net_income(PDO $pdo, int $bookId, string $basis, ?string $from, string $to): int
+function ledger_net_income(PDO $pdo, int $bookId, string $basis, ?string $from, string $to, bool $excludeClosing = false): int
 {
     $n = 0;
-    foreach (ledger_activity($pdo, $bookId, $basis, $from, $to) as $a) {
+    foreach (ledger_activity($pdo, $bookId, $basis, $from, $to, $excludeClosing) as $a) {
         if (in_array($a['type'], ['revenue', 'expense'], true)) {
             $n -= $a['net'];
         }
@@ -227,7 +228,8 @@ function ledger_cash_flow(PDO $pdo, int $bookId, string $basis, string $from, st
         'financing' => ['rows' => [], 'total' => 0],
     ];
     $cashChange = $restrictedChange = 0;
-    foreach (ledger_activity($pdo, $bookId, $basis, $from, $to) as $a) {
+    // Year-end closing entries move earnings between accounts; no cash moves.
+    foreach (ledger_activity($pdo, $bookId, $basis, $from, $to, true) as $a) {
         if ($a['net'] === 0) {
             continue;
         }
@@ -316,9 +318,10 @@ function ledger_equity_statement(PDO $pdo, int $bookId, string $basis, string $f
     // equity account, then this period's net income.
     $fyFrom = ledger_fiscal_year_start($pdo, $bookId, $from);
     $earlierOpen = ledger_net_income($pdo, $bookId, $basis, null, ledger_day_before($from));
-    $ni = ledger_net_income($pdo, $bookId, $basis, $from, $to);
+    $ni = ledger_net_income($pdo, $bookId, $basis, $from, $to, true);
+    $closed = $ni - ledger_net_income($pdo, $bookId, $basis, $from, $to);   // moved into an equity account by a year-end close
     $rows[] = ['account_id' => null, 'code' => '', 'name' => 'Earnings not yet closed', 'owner' => '',
-               'opening' => $earlierOpen, 'contributions' => 0, 'draws' => 0, 'other' => 0, 'net_income' => $ni, 'closing' => $earlierOpen + $ni];
+               'opening' => $earlierOpen, 'contributions' => 0, 'draws' => 0, 'other' => -$closed, 'net_income' => $ni, 'closing' => $earlierOpen + $ni - $closed];
     $tot = ['opening' => 0, 'contributions' => 0, 'draws' => 0, 'other' => 0, 'net_income' => 0, 'closing' => 0];
     foreach ($rows as $r) {
         foreach ($tot as $k => $_) {
@@ -597,5 +600,56 @@ function ledger_unlock(PDO $pdo, int $bookId, ?string $lockedThrough, string $by
             ->execute(['b' => $bookId, 'f' => $lockedThrough ?? $cur, 't' => $cur, 'z' => str_repeat('0', 64),
                        'j' => ledger_fingerprint($pdo, $bookId, (string) $cur), 'by' => mb_substr($by, 0, 120), 'n' => mb_substr(trim($reason), 0, 1000), 'u' => $lockedThrough]);
         $pdo->prepare('UPDATE ledger.books SET locked_through = :t WHERE id = :b')->execute(['t' => $lockedThrough, 'b' => $bookId]);
+    });
+}
+
+
+/**
+ * Year-end close: on each basis, one entry that zeroes the year's revenue
+ * and expense accounts into an equity account (retained earnings for a
+ * corporation, owner's or partners' capital otherwise, unless told). The
+ * statements leave these entries out of profit and loss and cash flow, so
+ * the year still shows what it earned. Must run before the year end is
+ * locked. Idempotent per year and basis. Returns the entry ids by basis.
+ */
+function ledger_year_end_close(PDO $pdo, int $bookId, string $fyEnd, string $actor, ?string $target = null): array
+{
+    if (!ledger_is_date($fyEnd)) {
+        throw new LedgerError('Give the last day of the fiscal year.');
+    }
+    $b = $pdo->prepare('SELECT * FROM ledger.books WHERE id = :b');
+    $b->execute(['b' => $bookId]);
+    $book = $b->fetch(PDO::FETCH_ASSOC);
+    $fyStart = ledger_fiscal_year_start($pdo, $bookId, $fyEnd);
+    if (ledger_day_before(gmdate('Y-m-d', strtotime($fyStart . ' +1 year'))) !== $fyEnd) {
+        throw new LedgerError('That is not the last day of a fiscal year (it starts ' . $fyStart . ').');
+    }
+    if ($book['locked_through'] !== null && $book['locked_through'] >= $fyEnd) {
+        throw new LedgerError('The year end is already locked; close the year before signing its last month.');
+    }
+    $target = $target ?? (in_array($book['tax_treatment'], ['s_corp', 'c_corp', 'unspecified'], true) ? 'equity.retained' : 'equity.capital');
+    return ledger_atomic($pdo, function () use ($pdo, $bookId, $fyStart, $fyEnd, $actor, $target) {
+        $out = [];
+        foreach (['accrual', 'cash'] as $basis) {
+            $lines = [];
+            $ni = 0;
+            foreach (ledger_activity($pdo, $bookId, $basis, $fyStart, $fyEnd, true) as $a) {
+                if (!in_array($a['type'], ['revenue', 'expense'], true) || $a['net'] === 0) {
+                    continue;
+                }
+                $lines[] = ['account' => (int) $a['id'], 'credit' => $a['net'], 'memo' => 'Year-end close'];   // a debit balance is credited away, and the reverse
+                $ni -= $a['net'];
+            }
+            if (!$lines) {
+                continue;
+            }
+            $lines[] = ['account' => $target, 'credit' => $ni, 'memo' => 'Net income for the year ending ' . $fyEnd];
+            $out[$basis] = ledger_post($pdo, $bookId, [
+                'entry_on' => $fyEnd, 'basis' => $basis, 'source_key' => "year_end:$fyEnd:$basis", 'event_type' => 'period.year_end',
+                'rule' => 'core.year_end', 'rule_version' => 1, 'memo' => 'Year-end close, ' . $fyStart . ' to ' . $fyEnd . ' (' . $basis . ')',
+                'actor' => $actor, 'lines' => $lines,
+            ]);
+        }
+        return $out;
     });
 }

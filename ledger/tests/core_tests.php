@@ -577,3 +577,37 @@ function test_ledger_bank_reconciliation(): void
     check_refused(fn() => $pdo->exec("UPDATE ledger.bank_lines SET amount_cents = 1 WHERE id = $lineId"), 'a bank line was edited');
     check_same(1, ledger_bank_auto_match($pdo, $b, 'cash.operating', 'tester'), 'the March 31 deposit matched in April');
 }
+
+function test_ledger_year_end_close_moves_earnings_without_double_counting(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('yearend');
+    ledger_book_set_entity($pdo, $b, 'corporation', 'c_corp');
+    ledger_post($pdo, $b, ['entry_on' => '2025-06-01', 'lines' => [['account' => 'cash.operating', 'debit' => 500000], ['account' => 'equity.stock', 'credit' => 500000]]]);
+    ledger_post($pdo, $b, ['entry_on' => '2025-07-01', 'lines' => [['account' => 'cash.operating', 'debit' => 300000], ['account' => 'revenue.services', 'credit' => 300000]]]);
+    ledger_post($pdo, $b, ['entry_on' => '2025-08-01', 'lines' => [['account' => 'exp.rent', 'debit' => 100000], ['account' => 'cash.operating', 'credit' => 100000]]]);
+    $inv = lt_invoice($pdo, $b, 'inv:ye', '2025-12-15', [['revenue.services', 50000]]);   // unpaid at year end: accrual only
+    try {
+        ledger_year_end_close($pdo, $b, '2025-11-30', 'owner');
+        check(false, 'a year end that is not one');
+    } catch (LedgerError) {
+    }
+    $ids = ledger_year_end_close($pdo, $b, '2025-12-31', 'owner');
+    check_same($ids, ledger_year_end_close($pdo, $b, '2025-12-31', 'owner'), 'the year was closed twice');
+    // Accrual earned $2,500; cash $2,000. Each basis closes its own.
+    check_same(-250000, ledger_balance($pdo, $b, 'equity.retained', 'accrual'), 'accrual retained earnings');
+    check_same(-200000, ledger_balance($pdo, $b, 'equity.retained', 'cash'), 'cash retained earnings');
+    // The year's P&L still shows what it earned; the cash flow is unchanged by the close.
+    check_same(250000, ledger_profit_and_loss($pdo, $b, 'accrual', '2025-01-01', '2025-12-31')['net_income'], 'P&L after the close');
+    check_same(200000, ledger_cash_flow($pdo, $b, 'cash', '2025-01-01', '2025-12-31')['net_income'], 'cash flow after the close');
+    // Equity is not counted twice.
+    $bs = ledger_balance_sheet($pdo, $b, 'accrual', '2025-12-31');
+    check($bs['balanced'], 'the balance sheet does not balance after the close');
+    check_same(750000, $bs['total_equity'], 'equity after the close: $5,000 stock + $2,500 earned');
+    check_same(750000, ledger_balance_sheet($pdo, $b, 'accrual', '2026-01-31')['total_equity'], 'equity in the new year');
+    $eq = ledger_equity_statement($pdo, $b, 'accrual', '2025-01-01', '2025-12-31');
+    check_same([250000, 750000], [$eq['totals']['net_income'], $eq['totals']['closing']], 'the equity statement for the year');
+    foreach (['accrual', 'cash'] as $basis) {
+        check_same([], ledger_tie_outs($pdo, $b, $basis, '2025-01-01', '2025-12-31'), "tie-outs for the closed year, $basis");
+        check_same([], ledger_tie_outs($pdo, $b, $basis, '2025-12-01', '2026-01-31'), "tie-outs across the year end, $basis");
+    }
+}
