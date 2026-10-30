@@ -541,3 +541,39 @@ function test_ledger_cash_forecast_windows_bands_and_risks(): void
     $kinds = array_column($f['risks'], 'kind');
     check(in_array('late_payer', $kinds, true) && in_array('thin_data', $kinds, true), 'risks: ' . json_encode($kinds));
 }
+
+function test_ledger_bank_reconciliation(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('bank');
+    $post = fn(string $on, int $amt, string $other) => ledger_post($pdo, $b, ['entry_on' => $on, 'lines' => [
+        ['account' => 'cash.operating', 'debit' => $amt], ['account' => $other, 'credit' => $amt]]]);
+    $post('2026-03-01', 1000000, 'equity.capital');        // $10,000 in
+    $post('2026-03-10', -120000, 'exp.rent');               // check 101, $1,200 out (negative debit = credit)
+    $post('2026-03-30', -40000, 'exp.software');            // check 102, not yet cleared
+    $post('2026-03-31', 250000, 'revenue.services');        // deposit, in transit
+    // The bank: the $10,000, check 101, a $25 fee and $3 interest. Closing $8,778.
+    [$added, $dupes] = ledger_bank_import($pdo, $b, 'cash.operating', '2026-03-01', '2026-03-31', 877800, [
+        ['2026-03-02', 1000000, 'DEPOSIT', '', 'b1'], ['2026-03-12', -120000, 'CHECK 101', '101', 'b2'],
+        ['2026-03-31', -2500, 'SERVICE FEE', '', 'b3'], ['2026-03-31', 300, 'INTEREST', '', 'b4']]);
+    check_same([4, 0], [$added, $dupes], 'import');
+    check_same([0, 4], ledger_bank_import($pdo, $b, 'cash.operating', '2026-03-01', '2026-03-31', 877800, [
+        ['2026-03-02', 1000000, 'DEPOSIT', '', 'b1'], ['2026-03-12', -120000, 'CHECK 101', '101', 'b2'],
+        ['2026-03-31', -2500, 'SERVICE FEE', '', 'b3'], ['2026-03-31', 300, 'INTEREST', '', 'b4']]), 'a second import added lines');
+    check_same(2, ledger_bank_auto_match($pdo, $b, 'cash.operating', 'tester'), 'auto-matched the deposit and check 101');
+    $r = ledger_bank_reconciliation($pdo, $b, 'cash.operating', '2026-03-31');
+    check(!$r['reconciled'], 'reconciled with bank-only items unposted');
+    check_same(2, count($r['bank_only']), 'the fee and interest are bank-only');
+    foreach ($r['bank_only'] as $bl) {
+        ledger_bank_post_line($pdo, $b, (int) $bl['id'], (int) $bl['amount_cents'] < 0 ? 'exp.bank_fees' : 'revenue.other', 'tester');
+    }
+    $r = ledger_bank_reconciliation($pdo, $b, 'cash.operating', '2026-03-31');
+    check_same([877800, 250000, 40000, 1087800, 1087800], [$r['bank_closing'], $r['in_transit'], $r['outstanding'], $r['adjusted_bank'], $r['books']], 'the reconciliation');
+    check($r['reconciled'], 'it does not reconcile');
+    // A match is for the same account and amount only.
+    $bl = ledger_bank_import($pdo, $b, 'cash.operating', '2026-04-01', '2026-04-30', null, [['2026-04-02', 250000, 'DEPOSIT', '', 'b5']]);
+    $lineId = (int) $pdo->query("SELECT id FROM ledger.bank_lines WHERE bank_id = 'b5'")->fetchColumn();
+    $wrong = (int) $pdo->query("SELECT l.id FROM ledger.lines l JOIN ledger.accounts a ON a.id = l.account_id WHERE a.book_id = $b AND a.system_key = 'exp.rent' LIMIT 1")->fetchColumn();
+    check_refused(fn() => $pdo->exec("UPDATE ledger.bank_lines SET matched_line_id = $wrong WHERE id = $lineId"), 'a bank line matched another account');
+    check_refused(fn() => $pdo->exec("UPDATE ledger.bank_lines SET amount_cents = 1 WHERE id = $lineId"), 'a bank line was edited');
+    check_same(1, ledger_bank_auto_match($pdo, $b, 'cash.operating', 'tester'), 'the March 31 deposit matched in April');
+}
