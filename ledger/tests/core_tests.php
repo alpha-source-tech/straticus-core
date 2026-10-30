@@ -509,3 +509,35 @@ function test_ledger_declining_balance_lands_on_salvage(): void
     check_same(450000, array_sum($sched), 'declining balance stops at salvage');
     check(reset($sched) > end($sched), 'declining balance does not decline');
 }
+
+function test_ledger_cash_forecast_windows_bands_and_risks(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('forecast');
+    ledger_account_ensure($pdo, $b, ['1060', 'Held for others', 'asset', 'Restricted cash: client trust', 'restricted_cash', ['key' => 't.held_cash']]);
+    ledger_account_ensure($pdo, $b, ['2550', 'Funds held for others', 'liability', 'Other current liabilities', 'operating', ['key' => 't.held', 'control' => 'trust_liability']]);
+    ledger_post($pdo, $b, ['entry_on' => '2026-01-02', 'lines' => [['account' => 'cash.operating', 'debit' => 1000000], ['account' => 'equity.capital', 'credit' => 1000000]]]);
+    // Money held for clients never counts as cash to spend.
+    ledger_post($pdo, $b, ['entry_on' => '2026-05-20', 'lines' => [['account' => 't.held_cash', 'debit' => 5000000], ['account' => 't.held', 'credit' => 5000000, 'party' => 'client:9']]]);
+    // Client A has paid three invoices, each 15 days late.
+    foreach (['01', '02', '03'] as $i => $mo) {
+        $doc = ledger_document_issue($pdo, $b, ['kind' => 'receivable', 'party' => 'client:A', 'ref' => "Old $mo", 'issued_on' => "2026-$mo-01", 'due_on' => "2026-$mo-10",
+            'source_key' => "old:$mo", 'lines' => [['account' => 'revenue.services', 'amount' => 100000]]]);
+        ledger_settle($pdo, $b, $doc, ['settled_on' => "2026-$mo-25", 'amount' => 100000, 'source_key' => "oldpay:$mo"]);
+    }
+    // Open now: A owes $5,000 due June 25 (expected July 10); B owes $2,000 due June 21 (no history); a bill of $8,000 due June 21.
+    ledger_document_issue($pdo, $b, ['kind' => 'receivable', 'party' => 'client:A', 'ref' => 'Inv A', 'issued_on' => '2026-05-25', 'due_on' => '2026-06-25',
+        'source_key' => 'inv:a', 'lines' => [['account' => 'revenue.services', 'amount' => 500000]]]);
+    ledger_document_issue($pdo, $b, ['kind' => 'receivable', 'party' => 'client:B', 'ref' => 'Inv B', 'issued_on' => '2026-05-22', 'due_on' => '2026-06-21',
+        'source_key' => 'inv:b', 'lines' => [['account' => 'revenue.services', 'amount' => 200000]]]);
+    ledger_document_issue($pdo, $b, ['kind' => 'payable', 'party' => 'vendor:rent-co', 'ref' => 'Bill 9', 'issued_on' => '2026-05-30', 'due_on' => '2026-06-21',
+        'source_key' => 'bill:9', 'lines' => [['account' => 'exp.office', 'amount' => 800000]]]);
+    $f = ledger_cash_forecast($pdo, $b, '2026-06-01', [['name' => 'Rent', 'amount' => 300000, 'day' => 1]]);
+    check_same(1300000, $f['opening'], 'opening cash: $10,000 in plus $3,000 collected, and no client trust money');
+    check_same([200000, 500000, 0], array_column($f['windows'], 'in'), 'inflows by window');
+    check_same([800000 + 300000 + 300000, 0, 300000], array_column($f['windows'], 'out'), 'outflows by window (rent on the 1st)');
+    check_same(30.0, $f['windows'][0]['band_pct'], 'a client with no history gets the default band');
+    check_same(0.0, $f['windows'][1]['band_pct'], 'a client who always pays 15 days late has no spread');
+    check_same(1300000 + 200000 - 1400000, $f['windows'][0]['cash_end'], 'cash at the end of the first window');
+    $kinds = array_column($f['risks'], 'kind');
+    check(in_array('late_payer', $kinds, true) && in_array('thin_data', $kinds, true), 'risks: ' . json_encode($kinds));
+}

@@ -418,10 +418,11 @@ function ledger_document_issue(PDO $pdo, int $bookId, array $d): int
         if (!ledger_is_date((string) ($d['issued_on'] ?? ''))) {
             throw new LedgerError('A document needs a date.');
         }
-        $q = $pdo->prepare('INSERT INTO ledger.documents (book_id, kind, party, ref, issued_on, total_cents, control_account_id, source_key)
-                            VALUES (:b, :k, :p, :r, :on, :t, :c, :sk) RETURNING id');
+        $due = (string) ($d['due_on'] ?? '');
+        $q = $pdo->prepare('INSERT INTO ledger.documents (book_id, kind, party, ref, issued_on, due_on, total_cents, control_account_id, source_key)
+                            VALUES (:b, :k, :p, :r, :on, :due, :t, :c, :sk) RETURNING id');
         $q->execute(['b' => $bookId, 'k' => $kind, 'p' => $d['party'], 'r' => mb_substr((string) ($d['ref'] ?? ''), 0, 80),
-                     'on' => $d['issued_on'], 't' => $total, 'c' => $control, 'sk' => $d['source_key']]);
+                     'on' => $d['issued_on'], 'due' => ledger_is_date($due) ? $due : null, 't' => $total, 'c' => $control, 'sk' => $d['source_key']]);
         $docId = (int) $q->fetchColumn();
         if ($total === 0) {
             return $docId;   // nothing owed: on record, nothing to post
@@ -898,3 +899,4 @@ function ledger_fingerprint(PDO $pdo, int $bookId, ?string $through = null): str
 
 require_once __DIR__ . '/statements.php';
 require_once __DIR__ . '/assets.php';
+require_once __DIR__ . '/forecast.php';
