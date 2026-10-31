@@ -197,7 +197,8 @@ function ledger_account_ensure(PDO $pdo, int $bookId, array $spec): int
         'et' => $opt['equity_type'] ?? null, 'op' => $opt['owner_party'] ?? '',
         'ao' => !empty($opt['accrual_only']) ? 't' : 'f', 'ctl' => $opt['control'] ?? 'none', 'k' => $key,
         // Which accounts keep statements: every cash account (a bank), and a liability marked as a card.
-        'sk' => $cf === 'cash' ? 'bank' : ($type === 'liability' && ($opt['statement_kind'] ?? '') === 'card' ? 'card' : ''),
+        // ('none' for cash kept apart inside another account, such as payroll set aside: no statements of its own).
+        'sk' => $cf === 'cash' ? (($opt['statement_kind'] ?? '') === 'none' ? '' : 'bank') : ($type === 'liability' && ($opt['statement_kind'] ?? '') === 'card' ? 'card' : ''),
     ]);
     return (int) $q->fetchColumn();
 }
