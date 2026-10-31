@@ -16,6 +16,7 @@ function ledger_template_core(): array
     return [
         ['1000', 'Operating cash',                 'asset',     'Cash and cash equivalents',   'cash',      ['key' => 'cash.operating']],
         ['1100', 'Accounts receivable',            'asset',     'Accounts receivable',         'operating', ['key' => 'ar', 'control' => 'receivable', 'accrual_only' => true]],
+        ['1090', 'Bank clearing',                  'asset',     'Prepaid and other current assets', 'operating', ['key' => 'bank_clearing']],
         ['1200', 'Prepaid expenses',               'asset',     'Prepaid and other current assets', 'operating', ['key' => 'prepaid', 'accrual_only' => true]],
         ['1500', 'Equipment and furniture',        'asset',     'Property and equipment, net', 'investing', ['key' => 'fixed.equipment']],
         ['1590', 'Accumulated depreciation',       'asset',     'Property and equipment, net', 'non_cash',  ['key' => 'fixed.accum_depr', 'contra' => true]],
