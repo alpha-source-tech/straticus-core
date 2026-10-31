@@ -809,6 +809,77 @@ function ledger_write_off(PDO $pdo, int $bookId, int $docId, array $w): int
 /* ── Reading the books ──────────────────────────────────────────────── */
 
 /**
+ * The summed journal between two dates, from the period sums for the whole
+ * months inside the range and from the lines for the partial months at its
+ * edges. Returns [sql, params]: a subquery with columns account_id, party,
+ * debit_cents, credit_cents (one row per line or per sum row; the caller
+ * groups). $from null means from the beginning. Options: 'exclude_closing'
+ * leaves year-end close entries out; 'account' limits to one account id;
+ * 'party' to one party. Figures equal the full sum exactly; only the cost
+ * differs.
+ */
+function ledger_sum_source(int $bookId, string $basis, ?string $from, ?string $to, array $opt = []): array
+{
+    $to = $to ?? '9999-12-31';
+    $p = ['b' => $bookId, 'basis' => $basis];
+    $where = 'book_id = :b AND basis IN (\'both\', :basis)';
+    $lwhere = 'l.book_id = :b AND e.basis IN (\'both\', :basis)';
+    if (!empty($opt['exclude_closing'])) {
+        $where .= ' AND NOT closing';
+        $lwhere .= " AND e.event_type <> 'period.year_end'";
+    }
+    if (isset($opt['account'])) {
+        $p['acct'] = (int) $opt['account'];
+        $where .= ' AND account_id = :acct';
+        $lwhere .= ' AND l.account_id = :acct';
+    }
+    if (isset($opt['party'])) {
+        $p['party'] = (string) $opt['party'];
+        $where .= ' AND party = :party';
+        $lwhere .= ' AND l.party = :party';
+    }
+    // Whole months come from the sums; the partial month at either edge from the lines.
+    $monthStart = fn(string $d) => substr($d, 0, 7) . '-01';
+    $monthEnd = fn(string $d) => gmdate('Y-m-t', strtotime($d));
+    $parts = [];
+    $edges = [];
+    if ($from !== null && substr($from, 0, 7) === substr($to, 0, 7) && !($from === $monthStart($from) && $to === $monthEnd($to))) {
+        $edges[] = [$from, $to];   // the range sits inside one month
+    } else {
+        $firstFull = $from === null ? null : ($from === $monthStart($from) ? $from : gmdate('Y-m-01', strtotime($monthStart($from) . ' +1 month')));
+        $lastFull = $to === $monthEnd($to) ? $monthStart($to) : gmdate('Y-m-01', strtotime($monthStart($to) . ' -1 month'));
+        if ($firstFull === null || $firstFull <= $lastFull) {
+            $p['m2'] = $lastFull;
+            if ($firstFull !== null) {
+                $p['m1'] = $firstFull;
+            }
+            $parts[] = "SELECT account_id, party, debit_cents, credit_cents FROM ledger.period_sums WHERE $where AND " . ($firstFull === null ? 'month <= :m2' : 'month BETWEEN :m1 AND :m2');
+        }
+        if ($from !== null && $from !== $monthStart($from)) {
+            $edges[] = [$from, $monthEnd($from)];
+        }
+        if ($to !== $monthEnd($to)) {
+            $edges[] = [$monthStart($to), $to];
+        }
+    }
+    foreach ($edges as $i => [$a, $z]) {
+        $p["e{$i}a"] = $a;
+        $p["e{$i}z"] = $z;
+        $parts[] = "SELECT l.account_id, l.party, l.debit_cents, l.credit_cents FROM ledger.lines l JOIN ledger.entries e ON e.id = l.entry_id
+                     WHERE $lwhere AND e.entry_on BETWEEN CAST(:e{$i}a AS date) AND CAST(:e{$i}z AS date)";
+    }
+    return ['(' . implode(' UNION ALL ', $parts) . ')', $p];
+}
+
+/** The journal's change-stamp: its newest line id. Cheap; changes whenever anything posts. */
+function ledger_stamp(PDO $pdo, int $bookId): int
+{
+    $q = $pdo->prepare('SELECT ledger.stamp(:b)');
+    $q->execute(['b' => $bookId]);
+    return (int) $q->fetchColumn();
+}
+
+/**
  * Trial balance on a basis, through a date: one row per account with any
  * posting, plus totals. Balances are signed debit-positive.
  *
@@ -819,14 +890,12 @@ function ledger_trial_balance(PDO $pdo, int $bookId, string $basis = 'accrual', 
     if (!in_array($basis, ['accrual', 'cash'], true)) {
         throw new LedgerError('A basis is accrual or cash.');
     }
+    [$src, $p] = ledger_sum_source($bookId, $basis, null, $through);
     $q = $pdo->prepare("SELECT a.id, a.code, a.name, a.type, a.contra, a.active, a.system_key,
-                               SUM(l.debit_cents) AS debits, SUM(l.credit_cents) AS credits
-                          FROM ledger.lines l
-                          JOIN ledger.entries e ON e.id = l.entry_id
-                          JOIN ledger.accounts a ON a.id = l.account_id
-                         WHERE l.book_id = :b AND e.basis IN ('both', :basis) AND (CAST(:t AS date) IS NULL OR e.entry_on <= CAST(:t2 AS date))
+                               SUM(s.debit_cents) AS debits, SUM(s.credit_cents) AS credits
+                          FROM $src s JOIN ledger.accounts a ON a.id = s.account_id
                          GROUP BY a.id ORDER BY a.code");
-    $q->execute(['b' => $bookId, 'basis' => $basis, 't' => $through, 't2' => $through]);
+    $q->execute($p);
     $rows = [];
     $dr = $cr = 0;
     foreach ($q->fetchAll(PDO::FETCH_ASSOC) as $r) {
@@ -849,12 +918,9 @@ function ledger_trial_balance(PDO $pdo, int $bookId, string $basis = 'accrual', 
 function ledger_balance(PDO $pdo, int $bookId, int|string $account, string $basis = 'accrual', ?string $through = null, ?string $party = null): int
 {
     $acct = ledger_account_ref($pdo, $bookId, $account);
-    $q = $pdo->prepare("SELECT coalesce(SUM(l.debit_cents - l.credit_cents), 0)
-                          FROM ledger.lines l JOIN ledger.entries e ON e.id = l.entry_id
-                         WHERE l.account_id = :a AND e.basis IN ('both', :basis)
-                           AND (CAST(:t AS date) IS NULL OR e.entry_on <= CAST(:t2 AS date))
-                           AND (CAST(:p AS text) IS NULL OR l.party = :p2)");
-    $q->execute(['a' => $acct, 'basis' => $basis, 't' => $through, 't2' => $through, 'p' => $party, 'p2' => $party]);
+    [$src, $p] = ledger_sum_source($bookId, $basis, null, $through, ['account' => $acct] + ($party !== null ? ['party' => $party] : []));
+    $q = $pdo->prepare("SELECT coalesce(SUM(debit_cents - credit_cents), 0) FROM $src s");
+    $q->execute($p);
     return (int) $q->fetchColumn();
 }
 

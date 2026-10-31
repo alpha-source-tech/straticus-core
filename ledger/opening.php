@@ -275,9 +275,9 @@ function ledger_open_existing(PDO $pdo, int $bookId, string $startedOn, array $o
 /** Debit-positive balance of every account with any posting on or before a day (both bases, accrual view). */
 function ledger_balances_at(PDO $pdo, int $bookId, string $asOf): array
 {
-    $q = $pdo->prepare("SELECT l.account_id, SUM(l.debit_cents - l.credit_cents) AS bal FROM ledger.lines l JOIN ledger.entries e ON e.id = l.entry_id
-                         WHERE l.book_id = :b AND e.entry_on <= :d AND e.basis IN ('both', 'accrual') GROUP BY l.account_id");
-    $q->execute(['b' => $bookId, 'd' => $asOf]);
+    [$src, $p] = ledger_sum_source($bookId, 'accrual', null, $asOf);
+    $q = $pdo->prepare("SELECT account_id, SUM(debit_cents - credit_cents) AS bal FROM $src s GROUP BY account_id");
+    $q->execute($p);
     $out = [];
     foreach ($q->fetchAll(PDO::FETCH_ASSOC) as $r) {
         $out[(int) $r['account_id']] = (int) $r['bal'];

@@ -891,3 +891,75 @@ function test_ledger_existing_business_brings_balances_in_and_locks_the_past(): 
     check_same('receivable', $parsed['control'][0]['control'], 'the control row is set apart');
     check_same('9999', $parsed['unknown'][0]['account'], 'the unknown code is named');
 }
+
+/**
+ * Period sums: every read that adds the journal up gives the same figure
+ * whether it comes from the month sums, the lines, or both. Hand-placed
+ * entries across month edges, both bases, a year-end close and a party.
+ */
+function test_ledger_period_sums_equal_the_full_journal(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('sums');
+    ledger_book_set_entity($pdo, $b, 'corporation', 'c_corp');
+    $post = fn(string $on, array $lines, string $basis = 'both') => ledger_post($pdo, $b, ['entry_on' => $on, 'basis' => $basis, 'lines' => $lines]);
+    $post('2025-01-01', [['account' => 'cash.operating', 'debit' => 100000], ['account' => 'equity.stock', 'credit' => 100000]]);
+    $post('2025-01-31', [['account' => 'cash.operating', 'debit' => 1000], ['account' => 'revenue.services', 'credit' => 1000]]);
+    $post('2025-02-01', [['account' => 'cash.operating', 'debit' => 2000], ['account' => 'revenue.services', 'credit' => 2000]]);
+    $post('2025-02-14', [['account' => 'exp.rent', 'debit' => 300], ['account' => 'cash.operating', 'credit' => 300]], 'accrual');
+    $post('2025-02-14', [['account' => 'exp.rent', 'debit' => 400], ['account' => 'cash.operating', 'credit' => 400]], 'cash');
+    $post('2025-03-15', [['account' => 'cash.operating', 'debit' => 5000], ['account' => 'revenue.services', 'credit' => 5000]]);
+    lt_invoice($pdo, $b, 'inv:s1', '2025-04-10', [['revenue.services', 7000]], 'client:a');
+    lt_invoice($pdo, $b, 'inv:s2', '2025-04-20', [['revenue.services', 9000]], 'client:b');
+    $post('2025-12-31', [['account' => 'cash.operating', 'debit' => 1100], ['account' => 'revenue.services', 'credit' => 1100]]);
+    ledger_year_end_close($pdo, $b, '2025-12-31', 'owner');
+    $post('2026-01-10', [['account' => 'exp.rent', 'debit' => 600], ['account' => 'cash.operating', 'credit' => 600]]);
+
+    // The sums table and the journal agree line for line.
+    $q = $pdo->prepare("SELECT coalesce(SUM(debit_cents), 0) || '/' || coalesce(SUM(credit_cents), 0) FROM ledger.period_sums WHERE book_id = :b");
+    $q->execute(['b' => $b]);
+    $r = $pdo->prepare("SELECT coalesce(SUM(debit_cents), 0) || '/' || coalesce(SUM(credit_cents), 0) FROM ledger.lines WHERE book_id = :b");
+    $r->execute(['b' => $b]);
+    check_same($r->fetchColumn(), $q->fetchColumn(), 'the sums table drifted from the journal');
+
+    // Every kind of range a statement asks for, against the raw sum.
+    $raw = function (string $basis, ?string $from, ?string $to, bool $xc = false, ?string $party = null) use ($pdo, $b): array {
+        $q = $pdo->prepare("SELECT l.account_id, SUM(l.debit_cents - l.credit_cents) FROM ledger.lines l JOIN ledger.entries e ON e.id = l.entry_id
+                             WHERE l.book_id = :b AND e.basis IN ('both', :basis) AND (CAST(:f AS date) IS NULL OR e.entry_on >= CAST(:f2 AS date))
+                               AND (CAST(:t AS date) IS NULL OR e.entry_on <= CAST(:t2 AS date)) AND (NOT CAST(:xc AS boolean) OR e.event_type <> 'period.year_end')
+                               AND (CAST(:p AS text) IS NULL OR l.party = :p2)
+                             GROUP BY l.account_id ORDER BY l.account_id");
+        $q->execute(['b' => $b, 'basis' => $basis, 'f' => $from, 'f2' => $from, 't' => $to, 't2' => $to, 'xc' => $xc ? 'true' : 'false', 'p' => $party, 'p2' => $party]);
+        return array_map('intval', $q->fetchAll(PDO::FETCH_KEY_PAIR));
+    };
+    $viaSums = function (string $basis, ?string $from, ?string $to, bool $xc = false, ?string $party = null) use ($pdo, $b): array {
+        [$src, $p] = ledger_sum_source($b, $basis, $from, $to, ['exclude_closing' => $xc] + ($party !== null ? ['party' => $party] : []));
+        $q = $pdo->prepare("SELECT account_id, SUM(debit_cents - credit_cents) FROM $src s GROUP BY account_id ORDER BY account_id");
+        $q->execute($p);
+        return array_map('intval', $q->fetchAll(PDO::FETCH_KEY_PAIR));
+    };
+    $ranges = [
+        [null, null], [null, '2025-01-31'], [null, '2025-02-13'], [null, '2025-02-14'], [null, '2025-12-31'], [null, '2026-01-09'],
+        ['2025-01-01', '2025-01-31'], ['2025-01-15', '2025-01-20'], ['2025-01-15', '2025-01-31'], ['2025-01-31', '2025-02-01'],
+        ['2025-02-01', '2025-03-31'], ['2025-02-14', '2025-03-15'], ['2025-02-01', '2025-04-15'], ['2025-01-15', '2025-04-15'],
+        ['2025-03-01', '2025-03-01'], ['2025-02-14', '2025-02-14'], ['2024-01-01', '2026-12-31'], ['2025-12-01', '2026-01-31'],
+    ];
+    foreach (['accrual', 'cash'] as $basis) {
+        foreach ($ranges as [$from, $to]) {
+            foreach ([false, true] as $xc) {
+                check_same($raw($basis, $from, $to, $xc), $viaSums($basis, $from, $to, $xc), "range $basis " . ($from ?? 'start') . '..' . ($to ?? 'now') . ($xc ? ' excluding the close' : ''));
+            }
+        }
+        check_same($raw($basis, null, '2025-04-15', false, 'client:a'), $viaSums($basis, null, '2025-04-15', false, 'client:a'), "one party on $basis");
+    }
+    // The readers built on it.
+    check_same(-24000, ledger_balance($pdo, $b, 'revenue.services', 'accrual', '2025-12-30'), 'balance through a day inside a month (the 31st is not in it)');
+    check_same(16000, ledger_balance($pdo, $b, 'ar', 'accrual', null), 'a control account balance (debit-positive, two unpaid invoices)');
+    check_same(7000, ledger_balance($pdo, $b, 'ar', 'accrual', null, 'client:a'), 'a party balance');
+    check_same(24800, ledger_profit_and_loss($pdo, $b, 'accrual', '2025-01-01', '2025-12-31')['net_income'], 'the year P&L after the close: $251 of revenue less $3 of accrual rent');
+    check_same(-600, ledger_profit_and_loss($pdo, $b, 'accrual', '2026-01-01', '2026-01-31')['net_income'], 'January');
+    check(ledger_trial_balance($pdo, $b, 'cash')['balanced'], 'the trial balance');
+    check(ledger_stamp($pdo, $b) > 0, 'the stamp');
+    $before = ledger_stamp($pdo, $b);
+    $post('2026-02-01', [['account' => 'exp.rent', 'debit' => 1], ['account' => 'cash.operating', 'credit' => 1]]);
+    check(ledger_stamp($pdo, $b) > $before, 'the stamp moves when anything posts');
+}

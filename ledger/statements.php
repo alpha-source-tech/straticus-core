@@ -96,18 +96,13 @@ function ledger_cache_clear(): void
 
 function ledger_activity_query(PDO $pdo, int $bookId, string $basis, ?string $from, string $to, bool $excludeClosing): array
 {
+    [$src, $p] = ledger_sum_source($bookId, $basis, $from, $to, ['exclude_closing' => $excludeClosing]);
     $q = $pdo->prepare("SELECT a.id, a.code, a.name, a.type, a.contra, a.statement_line, a.cash_flow_class, a.equity_type,
                                a.owner_party, a.control, a.system_key, a.active,
-                               SUM(l.debit_cents - l.credit_cents) AS net
-                          FROM ledger.lines l
-                          JOIN ledger.entries e ON e.id = l.entry_id
-                          JOIN ledger.accounts a ON a.id = l.account_id
-                         WHERE l.book_id = :b AND e.basis IN ('both', :basis)
-                           AND e.entry_on <= CAST(:to AS date)
-                           AND (CAST(:from AS date) IS NULL OR e.entry_on >= CAST(:from2 AS date))
-                           AND (NOT CAST(:xc AS boolean) OR e.event_type <> 'period.year_end')
+                               SUM(s.debit_cents - s.credit_cents) AS net
+                          FROM $src s JOIN ledger.accounts a ON a.id = s.account_id
                          GROUP BY a.id ORDER BY a.code");
-    $q->execute(['b' => $bookId, 'basis' => $basis, 'to' => $to, 'from' => $from, 'from2' => $from, 'xc' => $excludeClosing ? 'true' : 'false']);
+    $q->execute($p);
     $out = [];
     foreach ($q->fetchAll(PDO::FETCH_ASSOC) as $r) {
         $r['net'] = (int) $r['net'];
