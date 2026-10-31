@@ -458,3 +458,137 @@ function ledger_feasibility(PDO $pdo, int $bookId, string $asOf, array $s, array
         'forecast_after' => $after['windows'],
     ];
 }
+
+/**
+ * Monthly trends for analytics, from the period sums (whole months, so the
+ * cost does not grow with the journal). For each month from $fromMonth to
+ * $toMonth ('Y-m'):
+ *   revenue      accrual revenue (sales as billed)
+ *   collected    cash-basis revenue (sales as paid)
+ *   expenses     accrual expenses
+ *   cash_in      money into the spendable cash accounts
+ *   cash_out     money out of them
+ *   net_cash     in less out
+ *   <group>      for each $flows group (key => [account system keys]): the
+ *                accrual expense on those accounts (payroll, marketing...)
+ *   <group>_end  for each $balances group: the credit balance at month end
+ *                (debt: loans, cards, payables...)
+ * and the ratios <flow>_to_revenue (percent, null without revenue). The
+ * totals row sums the flows over the period and takes balances at its end.
+ * Transfers between two cash accounts count as both in and out.
+ */
+function ledger_trends(PDO $pdo, int $bookId, string $fromMonth, string $toMonth, array $flows = [], array $balances = []): array
+{
+    if (!preg_match('/^\d{4}-\d{2}$/', $fromMonth) || !preg_match('/^\d{4}-\d{2}$/', $toMonth) || $fromMonth > $toMonth) {
+        throw new LedgerError('A trend needs a first and a last month, in order.');
+    }
+    $months = [];
+    for ($m = $fromMonth; $m <= $toMonth; $m = gmdate('Y-m', strtotime($m . '-01 +1 month'))) {
+        $months[$m] = ['month' => $m, 'revenue' => 0, 'collected' => 0, 'expenses' => 0, 'cash_in' => 0, 'cash_out' => 0];
+        foreach (array_keys($flows) as $g) {
+            $months[$m][$g] = 0;
+        }
+        if (count($months) > 120) {
+            throw new LedgerError('Ten years at most in one trend.');
+        }
+    }
+    $keyOf = [];
+    $q = $pdo->prepare('SELECT id, system_key, type, cash_flow_class FROM ledger.accounts WHERE book_id = :b');
+    $q->execute(['b' => $bookId]);
+    $acct = [];
+    foreach ($q->fetchAll(PDO::FETCH_ASSOC) as $a) {
+        $acct[(int) $a['id']] = $a;
+        $keyOf[(int) $a['id']] = (string) $a['system_key'];
+    }
+    $inGroup = function (int $id, array $groups) use ($keyOf): array {
+        $out = [];
+        foreach ($groups as $g => $keys) {
+            if (in_array($keyOf[$id] ?? '', $keys, true)) {
+                $out[] = $g;
+            }
+        }
+        return $out;
+    };
+    $q = $pdo->prepare("SELECT to_char(month, 'YYYY-MM') AS m, account_id, basis, SUM(debit_cents) AS dr, SUM(credit_cents) AS cr
+                          FROM ledger.period_sums WHERE book_id = :b AND NOT closing AND month BETWEEN CAST(:f AS date) AND CAST(:t AS date)
+                         GROUP BY month, account_id, basis");
+    $q->execute(['b' => $bookId, 'f' => $fromMonth . '-01', 't' => $toMonth . '-01']);
+    foreach ($q->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $m = $r['m'];
+        $id = (int) $r['account_id'];
+        $a = $acct[$id] ?? null;
+        if (!$a || !isset($months[$m])) {
+            continue;
+        }
+        $dr = (int) $r['dr'];
+        $cr = (int) $r['cr'];
+        $accrual = in_array($r['basis'], ['both', 'accrual'], true);
+        $cash = in_array($r['basis'], ['both', 'cash'], true);
+        if ($a['type'] === 'revenue') {
+            $months[$m]['revenue'] += $accrual ? $cr - $dr : 0;
+            $months[$m]['collected'] += $cash ? $cr - $dr : 0;
+        } elseif ($a['type'] === 'expense' && $accrual) {
+            $months[$m]['expenses'] += $dr - $cr;
+            foreach ($inGroup($id, $flows) as $g) {
+                $months[$m][$g] += $dr - $cr;
+            }
+        }
+        if ($a['cash_flow_class'] === 'cash' && $accrual) {
+            $months[$m]['cash_in'] += $dr;
+            $months[$m]['cash_out'] += $cr;
+        }
+    }
+    // Balances at each month end: what stood before the first month, then month by month.
+    $starts = [];
+    foreach ($balances as $g => $keys) {
+        $ids = array_keys(array_filter($keyOf, fn($k) => in_array($k, $keys, true)));
+        $run = 0;
+        if ($ids) {
+            $q = $pdo->prepare("SELECT coalesce(SUM(credit_cents - debit_cents), 0) FROM ledger.period_sums
+                                 WHERE book_id = :b AND basis IN ('both', 'accrual') AND month < CAST(:f AS date) AND account_id = ANY (CAST(:ids AS bigint[]))");
+            $q->execute(['b' => $bookId, 'f' => $fromMonth . '-01', 'ids' => '{' . implode(',', $ids) . '}']);
+            $run = (int) $q->fetchColumn();
+            $q = $pdo->prepare("SELECT to_char(month, 'YYYY-MM'), SUM(credit_cents - debit_cents) FROM ledger.period_sums
+                                 WHERE book_id = :b AND basis IN ('both', 'accrual') AND month BETWEEN CAST(:f AS date) AND CAST(:t AS date) AND account_id = ANY (CAST(:ids AS bigint[]))
+                                 GROUP BY month");
+            $q->execute(['b' => $bookId, 'f' => $fromMonth . '-01', 't' => $toMonth . '-01', 'ids' => '{' . implode(',', $ids) . '}']);
+            $moves = array_map('intval', $q->fetchAll(PDO::FETCH_KEY_PAIR));
+        } else {
+            $moves = [];
+        }
+        $starts[$g] = $run;
+        foreach ($months as $m => &$row) {
+            $run += $moves[$m] ?? 0;
+            $row[$g . '_end'] = $run;
+        }
+        unset($row);
+    }
+    $pct = fn(int $part, int $whole) => $whole > 0 ? round($part / $whole * 100, 1) : null;
+    foreach ($months as &$row) {
+        $row['net_cash'] = $row['cash_in'] - $row['cash_out'];
+        foreach (array_keys($flows) as $g) {
+            $row[$g . '_to_revenue'] = $pct($row[$g], $row['revenue']);
+        }
+    }
+    unset($row);
+    $rows = array_values($months);
+    $tot = ['months' => count($rows)];
+    foreach (array_merge(['revenue', 'collected', 'expenses', 'cash_in', 'cash_out', 'net_cash'], array_keys($flows)) as $k) {
+        $tot[$k] = array_sum(array_column($rows, $k));
+    }
+    foreach (array_keys($flows) as $g) {
+        $tot[$g . '_to_revenue'] = $pct($tot[$g], $tot['revenue']);
+    }
+    foreach (array_keys($balances) as $g) {
+        $tot[$g . '_start'] = $starts[$g] ?? 0;
+        $tot[$g . '_end'] = $rows ? $rows[count($rows) - 1][$g . '_end'] : 0;
+    }
+    // Direction: the later half of the period against the earlier half, for each flow (null when too short or no base).
+    $half = intdiv(count($rows), 2);
+    foreach (array_merge(['revenue', 'collected', 'net_cash'], array_keys($flows)) as $k) {
+        $a = $half > 0 ? array_sum(array_column(array_slice($rows, 0, $half), $k)) : 0;
+        $b = $half > 0 ? array_sum(array_column(array_slice($rows, -$half), $k)) : 0;
+        $tot[$k . '_change'] = $half > 0 && $a > 0 ? round(($b - $a) / $a * 100, 1) : null;
+    }
+    return ['from' => $fromMonth, 'to' => $toMonth, 'months' => $rows, 'totals' => $tot];
+}

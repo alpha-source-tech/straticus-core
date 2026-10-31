@@ -1036,3 +1036,37 @@ function test_ledger_loans_split_principal_interest_and_the_current_portion(): v
         check(str_contains($e->getMessage(), 'interest'), 'the refusal names the problem: ' . $e->getMessage());
     }
 }
+
+/** Trends: monthly sales, collections, cash in and out, payroll and marketing with their share of sales, debt at each month end. */
+function test_ledger_trends_month_by_month(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('trends');
+    $post = fn(string $on, array $lines, string $basis = 'both') => ledger_post($pdo, $b, ['entry_on' => $on, 'basis' => $basis, 'lines' => $lines]);
+    $post('2026-01-02', [['account' => 'cash.operating', 'debit' => 1000000], ['account' => 'equity.capital', 'credit' => 1000000]]);
+    // January: $10,000 billed, $4,000 collected; payroll $3,000; marketing $500; a $5,000 loan.
+    $inv = lt_invoice($pdo, $b, 'inv:t1', '2026-01-10', [['revenue.services', 1000000]], 'client:t');
+    ledger_settle($pdo, $b, $inv, ['settled_on' => '2026-01-25', 'amount' => 400000, 'source_key' => 'pay:t1', 'allocations' => [lt_line_ids($pdo, $inv)[0] => 400000]]);
+    $post('2026-01-31', [['account' => 'exp.salaries', 'debit' => 300000], ['account' => 'cash.operating', 'credit' => 300000]]);
+    $post('2026-01-15', [['account' => 'exp.marketing', 'debit' => 50000], ['account' => 'cash.operating', 'credit' => 50000]]);
+    $post('2026-01-20', [['account' => 'cash.operating', 'debit' => 500000], ['account' => 'loans', 'credit' => 500000]]);
+    // February: $6,000 collected (the rest of January's invoice), payroll $3,000, $1,000 of the loan repaid, a $250 card charge.
+    ledger_settle($pdo, $b, $inv, ['settled_on' => '2026-02-10', 'amount' => 600000, 'source_key' => 'pay:t2', 'allocations' => [lt_line_ids($pdo, $inv)[0] => 600000]]);
+    $post('2026-02-28', [['account' => 'exp.salaries', 'debit' => 300000], ['account' => 'cash.operating', 'credit' => 300000]]);
+    $post('2026-02-20', [['account' => 'loans', 'debit' => 100000], ['account' => 'cash.operating', 'credit' => 100000]]);
+    $post('2026-02-21', [['account' => 'exp.office', 'debit' => 25000], ['account' => 'cards', 'credit' => 25000]]);
+    $t = ledger_trends($pdo, $b, '2026-01', '2026-03', ['payroll' => ['exp.salaries'], 'marketing' => ['exp.marketing']], ['debt' => ['loans', 'loans_current', 'cards', 'ap']]);
+    [$jan, $feb, $mar] = $t['months'];
+    check_same([1000000, 400000, 300000, 50000, 30.0, 5.0], [$jan['revenue'], $jan['collected'], $jan['payroll'], $jan['marketing'], $jan['payroll_to_revenue'], $jan['marketing_to_revenue']], 'January');
+    check_same([1000000 + 400000 + 500000, 300000 + 50000], [$jan['cash_in'], $jan['cash_out']], 'January cash in and out');
+    check_same([0, 600000, 300000, null], [$feb['revenue'], $feb['collected'], $feb['payroll'], $feb['payroll_to_revenue']], 'February: collections without billing; no ratio without sales');
+    check_same([600000, 400000, 200000], [$feb['cash_in'], $feb['cash_out'], $feb['net_cash']], 'February cash');
+    check_same([500000, 425000, 425000], [$jan['debt_end'], $feb['debt_end'], $mar['debt_end']], 'debt at each month end: the loan, less what was repaid, plus the card');
+    $tot = $t['totals'];
+    check_same([1000000, 1000000, 600000, 0, 425000], [$tot['revenue'], $tot['collected'], $tot['payroll'], $tot['debt_start'], $tot['debt_end']], 'the period');
+    check_same(60.0, $tot['payroll_to_revenue'], 'payroll was 60% of the period\'s sales');
+    try {
+        ledger_trends($pdo, $b, '2026-03', '2026-01');
+        check(false, 'a backwards period');
+    } catch (LedgerError) {
+    }
+}
