@@ -538,6 +538,20 @@ function ledger_trends(PDO $pdo, int $bookId, string $fromMonth, string $toMonth
             $months[$m]['cash_out'] += $cr;
         }
     }
+    // Money moved between the firm's own cash accounts (operating to savings, say) is neither in nor out:
+    // an entry whose every line is a cash account is taken back off both sides.
+    $q = $pdo->prepare("SELECT to_char(e.entry_on, 'YYYY-MM') AS m, SUM(l.debit_cents) AS dr
+                          FROM ledger.entries e JOIN ledger.lines l ON l.entry_id = e.id
+                         WHERE e.book_id = :b AND e.basis IN ('both', 'accrual') AND e.entry_on >= CAST(:f AS date) AND e.entry_on < CAST(:t AS date) + interval '1 month'
+                           AND NOT EXISTS (SELECT 1 FROM ledger.lines x JOIN ledger.accounts a ON a.id = x.account_id WHERE x.entry_id = e.id AND a.cash_flow_class <> 'cash')
+                         GROUP BY 1");
+    $q->execute(['b' => $bookId, 'f' => $fromMonth . '-01', 't' => $toMonth . '-01']);
+    foreach ($q->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        if (isset($months[$r['m']])) {
+            $months[$r['m']]['cash_in'] -= (int) $r['dr'];
+            $months[$r['m']]['cash_out'] -= (int) $r['dr'];
+        }
+    }
     // Balances at each month end: what stood before the first month, then month by month.
     $starts = [];
     foreach ($balances as $g => $keys) {

@@ -1054,6 +1054,9 @@ function test_ledger_trends_month_by_month(): void
     $post('2026-02-28', [['account' => 'exp.salaries', 'debit' => 300000], ['account' => 'cash.operating', 'credit' => 300000]]);
     $post('2026-02-20', [['account' => 'loans', 'debit' => 100000], ['account' => 'cash.operating', 'credit' => 100000]]);
     $post('2026-02-21', [['account' => 'exp.office', 'debit' => 25000], ['account' => 'cards', 'credit' => 25000]]);
+    // Moving $2,000 from operating to savings is neither cash in nor cash out.
+    ledger_account_ensure($pdo, $b, ['1010', 'Savings', 'asset', 'Cash and cash equivalents', 'cash', ['key' => 'cash.savings']]);
+    $post('2026-02-25', [['account' => 'cash.savings', 'debit' => 200000], ['account' => 'cash.operating', 'credit' => 200000]]);
     $t = ledger_trends($pdo, $b, '2026-01', '2026-03', ['payroll' => ['exp.salaries'], 'marketing' => ['exp.marketing']], ['debt' => ['loans', 'loans_current', 'cards', 'ap']]);
     [$jan, $feb, $mar] = $t['months'];
     check_same([1000000, 400000, 300000, 50000, 30.0, 5.0], [$jan['revenue'], $jan['collected'], $jan['payroll'], $jan['marketing'], $jan['payroll_to_revenue'], $jan['marketing_to_revenue']], 'January');
