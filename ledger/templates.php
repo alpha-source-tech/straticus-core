@@ -21,7 +21,7 @@ function ledger_template_core(): array
         ['1500', 'Equipment and furniture',        'asset',     'Property and equipment, net', 'investing', ['key' => 'fixed.equipment']],
         ['1590', 'Accumulated depreciation',       'asset',     'Property and equipment, net', 'non_cash',  ['key' => 'fixed.accum_depr', 'contra' => true]],
         ['2000', 'Accounts payable',               'liability', 'Accounts payable',            'operating', ['key' => 'ap', 'control' => 'payable', 'accrual_only' => true]],
-        ['2100', 'Credit cards payable',           'liability', 'Other current liabilities',   'operating', ['key' => 'cards']],
+        ['2100', 'Credit cards payable',           'liability', 'Other current liabilities',   'operating', ['key' => 'cards', 'statement_kind' => 'card']],
         ['2200', 'Accrued liabilities',            'liability', 'Accrued liabilities',         'operating', ['key' => 'accrued', 'accrual_only' => true]],
         ['2300', 'Unapplied receipts',             'liability', 'Other current liabilities',   'operating', ['key' => 'unapplied_receipts']],
         ['2400', 'Customer credits',               'liability', 'Other current liabilities',   'operating', ['key' => 'customer_credits']],

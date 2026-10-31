@@ -189,13 +189,15 @@ function ledger_account_ensure(PDO $pdo, int $bookId, array $spec): int
     ledger_cache_clear();
     $code = ledger_free_code($pdo, $bookId, (string) $code);
     $q = $pdo->prepare('INSERT INTO ledger.accounts (book_id, code, name, type, contra, statement_line, cash_flow_class, equity_type,
-                                                     owner_party, accrual_only, control, system_key)
-                        VALUES (:b, :c, :n, :t, :ct, :sl, :cf, :et, :op, :ao, :ctl, :k) RETURNING id');
+                                                     owner_party, accrual_only, control, system_key, statement_kind)
+                        VALUES (:b, :c, :n, :t, :ct, :sl, :cf, :et, :op, :ao, :ctl, :k, :sk) RETURNING id');
     $q->execute([
         'b' => $bookId, 'c' => $code, 'n' => mb_substr($name, 0, 120), 't' => $type,
         'ct' => !empty($opt['contra']) ? 't' : 'f', 'sl' => $line, 'cf' => $cf,
         'et' => $opt['equity_type'] ?? null, 'op' => $opt['owner_party'] ?? '',
         'ao' => !empty($opt['accrual_only']) ? 't' : 'f', 'ctl' => $opt['control'] ?? 'none', 'k' => $key,
+        // Which accounts keep statements: every cash account (a bank), and a liability marked as a card.
+        'sk' => $cf === 'cash' ? 'bank' : ($type === 'liability' && ($opt['statement_kind'] ?? '') === 'card' ? 'card' : ''),
     ]);
     return (int) $q->fetchColumn();
 }
