@@ -442,6 +442,9 @@ function ledger_feasibility(PDO $pdo, int $bookId, string $asOf, array $s, array
         $reasons[] = sprintf('Cash stays above one month of costs on the low estimate (lowest point %s), and the business stays profitable (%s a month after the change).',
             ledger_money((int) $lowAfter), ledger_money($netAfter));
     }
+    if ($runRate > 0) {
+        $reasons[] = sprintf('Assumes usual collections of %s a month from a month out (the average of the last three months, cash basis): an assumption, not money already billed.', ledger_money($runRate));
+    }
     return [
         'scenario' => $label, 'kind' => $kind, 'verdict' => $verdict, 'reasons' => $reasons,
         'figures' => [
