@@ -802,3 +802,92 @@ function test_ledger_feasibility_verdicts_from_hand_worked_books(): void
         }
     }
 }
+
+function test_ledger_startup_opens_at_zero_with_a_contribution(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('startup');
+    check_same(false, ledger_origin($pdo, $b)['ready'], 'new books are not set up');
+    ledger_book_set_entity($pdo, $b, 'single_member_llc', 'sole_proprietor');
+    ledger_open_startup($pdo, $b, '2026-03-01', 1000000, 'owner');
+    $o = ledger_origin($pdo, $b);
+    check_same(['startup', '2026-03-01', true], [$o['origin'], $o['started_on'], $o['ready']], 'origin');
+    check_same(1000000, lt_balance($pdo, $b, 'cash.operating', 'accrual'), 'cash from the contribution');
+    $bs = ledger_balance_sheet($pdo, $b, 'cash', '2026-03-01');
+    check_same(1000000, $bs['total_equity'], 'equity on the cash basis too');
+    check_same([], ledger_tie_outs($pdo, $b, 'accrual', '2026-03-01', '2026-03-31'), 'ties out');
+    try {
+        ledger_open_startup($pdo, $b, '2026-03-01');
+        check(false, 'set up twice');
+    } catch (LedgerError) {
+    }
+}
+
+function test_ledger_existing_business_brings_balances_in_and_locks_the_past(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('existing');
+    ledger_book_set_entity($pdo, $b, 'pllc', 'sole_proprietor');
+    ledger_account_ensure($pdo, $b, ['1060', 'Held for others', 'asset', 'Restricted cash: client trust', 'restricted_cash', ['key' => 't.held_cash']]);
+    ledger_account_ensure($pdo, $b, ['2550', 'Funds held for others', 'liability', 'Other current liabilities', 'operating', ['key' => 't.held', 'control' => 'trust_liability']]);
+    // The old system's trial balance at 31 Dec: cash 25,000; AR 8,000 (two invoices); equipment 12,000 less 4,000 depreciation;
+    // AP 1,500 (one bill); trust 5,000; capital 30,000 and whatever is left is the old retained earnings.
+    $r = ledger_open_existing($pdo, $b, '2026-01-01', [
+        'balances' => [
+            ['account' => 'cash.operating', 'debit' => 2500000],
+            ['account' => 'equity.capital', 'credit' => 3000000],
+        ],
+        'receivables' => [
+            ['party' => 'client:1', 'ref' => 'INV-0040', 'issued_on' => '2025-11-15', 'due_on' => '2025-12-15', 'lines' => [['account' => 'revenue.services', 'amount' => 500000]]],
+            ['party' => 'client:2', 'ref' => 'INV-0041', 'issued_on' => '2025-12-20', 'lines' => [['account' => 'revenue.services', 'amount' => 300000]]],
+        ],
+        'payables' => [['party' => 'vendor:1', 'ref' => 'Bill 77', 'issued_on' => '2025-12-28', 'lines' => [['account' => 'exp.office', 'amount' => 150000]]]],
+        'assets' => [['name' => 'Server', 'cost' => 1200000, 'in_service_on' => '2024-01-01', 'life_months' => 36, 'accumulated' => 400000]],
+        'held' => [['party' => 'client:1', 'amount' => 300000], ['party' => 'client:3', 'amount' => 200000]],
+    ], 'owner');
+    check_same('2025-12-31', $r['as_of'], 'opening position date');
+    check_same(3, $r['documents'], 'documents issued');
+    // Assets 25,000 + 8,000 + 12,000 - 4,000 + 5,000 = 46,000; liabilities 1,500 + 5,000 = 6,500; capital 30,000 → retained 9,500 to opening equity.
+    check_same(950000, $r['plug'], 'the difference goes to opening-balance equity, and is reported');
+    $bs = ledger_balance_sheet($pdo, $b, 'accrual', '2025-12-31');
+    check_same(4600000, $bs['total_assets'], 'opening assets');
+    check_same(650000, $bs['total_liabilities'], 'opening liabilities');
+    check_same(3950000, $bs['total_equity'], 'opening equity');
+    check_same(800000, lt_balance($pdo, $b, 'ar', 'accrual', '2025-12-31'), 'receivables from the invoices alone');
+    check_same(0, ledger_profit_and_loss($pdo, $b, 'accrual', '2026-01-01', '2026-01-31')['net_income'], 'nothing of the old year leaks into January');
+    foreach (['accrual', 'cash'] as $basis) {
+        check_same([], ledger_tie_outs($pdo, $b, $basis, '2026-01-01', '2026-01-31'), "$basis ties out");
+    }
+    $o = ledger_origin($pdo, $b);
+    check_same(['existing', '2026-01-01', '2025-12-31'], [$o['origin'], $o['started_on'], $o['locked_through']], 'the past is locked');
+    // The old invoice is collected here: cash-basis revenue when paid, in January.
+    $doc = (int) $pdo->query("SELECT id FROM ledger.documents WHERE book_id = $b AND ref = 'INV-0040'")->fetchColumn();
+    ledger_settle($pdo, $b, $doc, ['settled_on' => '2026-01-10', 'amount' => 500000, 'source_key' => 'pay:40']);
+    check_same(300000, lt_balance($pdo, $b, 'ar', 'accrual'), 'receivable after collection');
+    check_same(-500000, lt_balance($pdo, $b, 'revenue.services', 'cash'), 'collected old work is cash-basis income when received');
+    check_same(0, ledger_profit_and_loss($pdo, $b, 'accrual', '2026-01-01', '2026-01-31')['net_income'], 'and not accrual income again');
+    // Depreciation continues from January as a change of estimate: 8,000 of book value left over the 12 months
+    // of life remaining = 666.67 a month (the old system had taken less than straight line would).
+    ledger_depreciate_through($pdo, $b, '2026-01-31');
+    check_same(-466667, lt_balance($pdo, $b, 'fixed.accum_depr', 'accrual'), 'accumulated depreciation after January');
+    // Nothing can be dated into the locked past.
+    try {
+        ledger_post($pdo, $b, ['entry_on' => '2025-12-15', 'lines' => [['account' => 'exp.office', 'debit' => 100], ['account' => 'cash.operating', 'credit' => 100]]]);
+        $moved = $pdo->query("SELECT original_on FROM ledger.entries WHERE book_id = $b ORDER BY id DESC LIMIT 1")->fetchColumn();
+        check($moved === '2025-12-15', 'an entry dated into the locked past is moved forward and remembered');
+    } catch (LedgerError) {
+    }
+    // Refusals: a revenue balance, a control-account figure.
+    ['pdo' => $pdo2, 'book' => $b2] = ledger_test_book('existing-bad');
+    foreach ([['account' => 'revenue.services', 'credit' => 100], ['account' => 'ar', 'debit' => 100]] as $bad) {
+        try {
+            ledger_open_existing($pdo2, $b2, '2026-01-01', ['balances' => [$bad]]);
+            check(false, 'accepted ' . json_encode($bad));
+        } catch (LedgerError) {
+        }
+    }
+    check_same(false, ledger_origin($pdo2, $b2)['ready'], 'a refused opening leaves the books unset');
+    // A trial balance file: control rows come back apart, unknown codes are named.
+    $parsed = ledger_opening_parse_csv($pdo2, $b2, "Code,Name,Debit,Credit\n1000,Operating cash,\"25,000.00\",\n1100,Accounts receivable,8000,\n9999,Mystery,10,\n3000,Capital,,30000\nTotal,,33010,30000\n");
+    check_same(2, count($parsed['balances']), 'balances parsed');
+    check_same('receivable', $parsed['control'][0]['control'], 'the control row is set apart');
+    check_same('9999', $parsed['unknown'][0]['account'], 'the unknown code is named');
+}
