@@ -759,3 +759,50 @@ function ledger_partner_capital(PDO $pdo, int $bookId, string $party): int
     return ledger_account_ensure($pdo, $bookId, ['3010', 'Capital: ' . $party, 'equity', "Partners' capital", 'financing',
         ['key' => $key, 'equity_type' => 'capital', 'owner_party' => $party]]);
 }
+
+/**
+ * Cash vs accrual, explained: accrual net income less cash net income for a
+ * period, line by line. Both bases share every entry marked 'both', so the
+ * difference is exactly the profit effect of the accrual-only entries less
+ * that of the cash-only ones, grouped by what they are: fees billed against
+ * fees collected, bills received against bills paid, write-offs, hand-made
+ * accruals and deferrals, opening balances. 'ties' says the lines add up to
+ * the difference of the two profit and loss statements to the cent.
+ * Groups: fees, bad_debt, costs, manual, opening, other.
+ */
+function ledger_basis_bridge(PDO $pdo, int $bookId, string $from, string $to): array
+{
+    $q = $pdo->prepare("SELECT e.basis, e.event_type,
+                               SUM(CASE WHEN a.type IN ('revenue', 'expense') THEN l.credit_cents - l.debit_cents ELSE 0 END) AS pl
+                          FROM ledger.lines l JOIN ledger.entries e ON e.id = l.entry_id JOIN ledger.accounts a ON a.id = l.account_id
+                         WHERE l.book_id = :b AND e.basis IN ('accrual', 'cash') AND e.entry_on BETWEEN CAST(:f AS date) AND CAST(:t AS date)
+                           AND e.event_type <> 'period.year_end'
+                         GROUP BY e.basis, e.event_type");
+    $q->execute(['b' => $bookId, 'f' => $from, 't' => $to]);
+    $group = fn(string $t) => match (true) {
+        in_array($t, ['receivable.issued', 'receivable.paid', 'payment.assigned', 'receivable.overpaid'], true) => 'fees',
+        $t === 'receivable.written_off' => 'bad_debt',
+        in_array($t, ['payable.issued', 'payable.paid'], true) => 'costs',
+        $t === 'manual' => 'manual',
+        str_starts_with($t, 'opening.') => 'opening',
+        default => 'other',
+    };
+    $rows = [];
+    foreach ($q->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $g = $group((string) $r['event_type']);
+        $rows[$g] ??= ['group' => $g, 'accrual' => 0, 'cash' => 0, 'difference' => 0];
+        $rows[$g][$r['basis']] += (int) $r['pl'];
+    }
+    foreach ($rows as &$r) {
+        $r['difference'] = $r['accrual'] - $r['cash'];
+    }
+    unset($r);
+    $order = ['fees' => 0, 'bad_debt' => 1, 'costs' => 2, 'manual' => 3, 'opening' => 4, 'other' => 5];
+    uksort($rows, fn($x, $y) => $order[$x] <=> $order[$y]);
+    $rows = array_values(array_filter($rows, fn($r) => $r['accrual'] !== 0 || $r['cash'] !== 0));
+    $acc = ledger_net_income($pdo, $bookId, 'accrual', $from, $to, true);
+    $cash = ledger_net_income($pdo, $bookId, 'cash', $from, $to, true);
+    $sum = array_sum(array_column($rows, 'difference'));
+    return ['from' => $from, 'to' => $to, 'accrual_net_income' => $acc, 'cash_net_income' => $cash,
+            'difference' => $acc - $cash, 'rows' => $rows, 'explained' => $sum, 'ties' => $sum === $acc - $cash];
+}
