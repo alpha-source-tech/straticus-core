@@ -25,6 +25,7 @@ function ledger_template_core(): array
         ['2300', 'Unapplied receipts',             'liability', 'Other current liabilities',   'operating', ['key' => 'unapplied_receipts']],
         ['2400', 'Customer credits',               'liability', 'Other current liabilities',   'operating', ['key' => 'customer_credits']],
         ['2700', 'Loans payable',                  'liability', 'Long-term debt',              'financing', ['key' => 'loans']],
+        ['2710', 'Current portion of long-term debt', 'liability', 'Other current liabilities', 'financing', ['key' => 'loans_current']],
         ['3900', 'Retained earnings',              'equity',    'Retained earnings',           'none',      ['key' => 'equity.retained', 'equity_type' => 'retained_earnings']],
         ['3950', 'Opening balance equity',         'equity',    'Opening balance equity',      'none',      ['key' => 'equity.opening', 'equity_type' => 'opening_balance']],
         ['4000', 'Service revenue',                'revenue',   'Revenue',                     'none',      ['key' => 'revenue.services']],

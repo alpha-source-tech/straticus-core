@@ -971,3 +971,4 @@ require_once __DIR__ . '/forecast.php';
 require_once __DIR__ . '/bank.php';
 require_once __DIR__ . '/analysis.php';
 require_once __DIR__ . '/opening.php';
+require_once __DIR__ . '/loans.php';

@@ -963,3 +963,76 @@ function test_ledger_period_sums_equal_the_full_journal(): void
     $post('2026-02-01', [['account' => 'exp.rent', 'debit' => 1], ['account' => 'cash.operating', 'credit' => 1]]);
     check(ledger_stamp($pdo, $b) > $before, 'the stamp moves when anything posts');
 }
+
+/**
+ * Loans: a $20,000 purchase financed at 6% over 36 months. The asset and the
+ * debt go on the balance sheet, nothing on the P&L; each payment splits into
+ * principal (balance sheet) and interest (P&L); the principal due within a
+ * year sits in the current portion; the last payment closes the loan.
+ */
+function test_ledger_loans_split_principal_interest_and_the_current_portion(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('loans');
+    ledger_post($pdo, $b, ['entry_on' => '2026-01-02', 'lines' => [['account' => 'cash.operating', 'debit' => 500000], ['account' => 'equity.capital', 'credit' => 500000]]]);
+    // The equipment goes on the register with no cash leaving; the loan pays for it.
+    $asset = ledger_asset_add($pdo, $b, ['name' => 'Copier', 'cost' => 2000000, 'in_service_on' => '2026-01-10', 'life_months' => 60, 'source_key' => 'asset:copier']);
+    // 6% APR, 36 payments of $608.44: the standard amortisation of $20,000.
+    $loan = ledger_loan_open($pdo, $b, ['name' => 'Copier loan', 'lender' => 'Harbor Bank', 'principal' => 2000000, 'apr_bp' => 600, 'payment' => 60844, 'payments_n' => 36,
+        'first_payment_on' => '2026-02-10', 'opened_on' => '2026-01-10', 'source_key' => 'loan:copier', 'against' => 'fixed.equipment', 'actor' => 'tester']);
+    check_same($loan, ledger_loan_open($pdo, $b, ['source_key' => 'loan:copier']), 'the same loan twice');
+    $l = ledger_loan($pdo, $b, $loan);
+    $sched = ledger_loan_schedule($l);
+    check_same([36, 10000, 50844, 1949156], [count($sched), $sched[0]['interest'], $sched[0]['principal'], $sched[0]['balance']], 'the first payment: $100 interest, $508.44 principal');
+    check_same(0, $sched[35]['balance'], 'the last payment clears it');
+    $totalInterest = array_sum(array_column($sched, 'interest'));
+    check($totalInterest > 180000 && $totalInterest < 195000, 'about $1,900 of interest over the life: ' . $totalInterest);
+
+    // Balance sheet only: equipment up $20,000, debt up $20,000, cash untouched, P&L untouched.
+    check_same(2000000, ledger_balance($pdo, $b, 'fixed.equipment'), 'the asset');
+    check_same(500000, ledger_balance($pdo, $b, 'cash.operating'), 'no cash moved');
+    check_same(2000000, ledger_loan_balance($pdo, $b, $l), 'the debt');
+    check_same(0, ledger_profit_and_loss($pdo, $b, 'accrual', '2026-01-01', '2026-01-31')['net_income'], 'nothing on the P&L');
+    // The current portion is the principal of the twelve payments due within a year of opening.
+    $due12 = array_sum(array_column(array_slice($sched, 0, 12), 'principal'));
+    $cur = -ledger_balance($pdo, $b, 'loans_current', 'accrual', null, 'loan:' . $loan);
+    check_same($due12, $cur, 'the current portion');
+    $bs = ledger_balance_sheet($pdo, $b, 'accrual', '2026-01-31');
+    $line = fn(string $sec, string $code) => (int) (array_values(array_filter($bs['sections'][$sec]['rows'], fn($r) => $r['code'] === $code))[0]['amount'] ?? 0);
+    check_same([$due12, 2000000 - $due12], [$line('current_liabilities', '2710'), $line('noncurrent_liabilities', '2700')], 'short-term and long-term on the balance sheet');
+
+    // One payment: cash down $608.44, interest $100 on the P&L, principal $508.44 off the debt, current portion re-split.
+    ledger_loan_pay($pdo, $b, $loan, ['paid_on' => '2026-02-10', 'amount' => 60844, 'source_key' => 'loanpay:1', 'actor' => 'tester']);
+    check_same([500000 - 60844, 1949156], [ledger_balance($pdo, $b, 'cash.operating'), ledger_loan_balance($pdo, $b, $l)], 'cash and debt after one payment');
+    check_same(10000, ledger_balance($pdo, $b, 'exp.interest', 'accrual', null, 'loan:' . $loan), 'the interest is a cost');
+    check_same(-10000, ledger_profit_and_loss($pdo, $b, 'accrual', '2026-02-01', '2026-02-28')['net_income'], 'February P&L carries only the interest');
+    $due12b = array_sum(array_column(array_slice($sched, 1, 12), 'principal'));
+    check_same($due12b, -ledger_balance($pdo, $b, 'loans_current', 'accrual', null, 'loan:' . $loan), 'the current portion moved forward a month');
+    check_same(2, ledger_loan_next($pdo, $b, $l)['n'], 'the next payment is the second');
+    // A payment with the bank's own interest figure.
+    ledger_loan_pay($pdo, $b, $loan, ['paid_on' => '2026-03-10', 'amount' => 60844, 'interest' => 9746, 'source_key' => 'loanpay:2']);
+    check_same(1949156 - (60844 - 9746), ledger_loan_balance($pdo, $b, $l), 'principal is the payment less the interest given');
+    // Overpaying the principal is refused; so is interest above the payment.
+    try {
+        ledger_loan_pay($pdo, $b, $loan, ['paid_on' => '2026-03-11', 'amount' => 5000000, 'source_key' => 'loanpay:bad']);
+        check(false, 'more than the loan owed was accepted');
+    } catch (LedgerError) {
+    }
+    // Pay the rest: the loan closes, the debt is zero on both accounts, the equipment is still on the books.
+    foreach (array_slice($sched, 2) as $row) {
+        $owed = ledger_loan_balance($pdo, $b, $l);
+        ledger_loan_pay($pdo, $b, $loan, ['paid_on' => $row['due_on'], 'amount' => min(60844, $owed + $row['interest']), 'source_key' => 'loanpay:' . $row['n']]);
+    }
+    $l = ledger_loan($pdo, $b, $loan);
+    check($l['closed_at'] !== null && ledger_loan_balance($pdo, $b, $l) === 0, 'repaid and closed');
+    check_same(0, -ledger_balance($pdo, $b, 'loans_current', 'accrual', null, 'loan:' . $loan), 'no current portion left');
+    check_same(2000000, ledger_balance($pdo, $b, 'fixed.equipment'), 'the asset stays');
+    check(ledger_trial_balance($pdo, $b, 'accrual')['balanced'] && ledger_trial_balance($pdo, $b, 'cash')['balanced'], 'both bases balance');
+    check_same([], ledger_tie_outs($pdo, $b, 'accrual', '2026-01-01', '2029-12-31'), 'the statements tie out');
+    // A payment that does not cover the interest is refused at the door.
+    try {
+        ledger_loan_open($pdo, $b, ['name' => 'Bad', 'principal' => 1000000, 'apr_bp' => 2400, 'payment' => 10000, 'payments_n' => 120, 'first_payment_on' => '2026-02-01', 'opened_on' => '2026-01-01', 'source_key' => 'loan:bad']);
+        check(false, 'a loan that never amortises was accepted');
+    } catch (LedgerError $e) {
+        check(str_contains($e->getMessage(), 'interest'), 'the refusal names the problem: ' . $e->getMessage());
+    }
+}
