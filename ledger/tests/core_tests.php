@@ -1073,3 +1073,103 @@ function test_ledger_trends_month_by_month(): void
     } catch (LedgerError) {
     }
 }
+
+/* ── Supporting documents ────────────────────────────────────────────── */
+
+function lt_store(): LedgerDirStore
+{
+    $d = sys_get_temp_dir() . '/ledger-attach-' . getmypid();
+    $GLOBALS['lt_store_dir'] = $d;
+    return new LedgerDirStore($d);
+}
+
+function lt_jpeg(string $salt = ''): string
+{
+    return "\xFF\xD8\xFF\xE0\x00\x10JFIF\x00" . str_repeat('receipt ' . $salt, 40) . "\xFF\xD9";
+}
+
+function test_ledger_attachments_fingerprint_and_keep_the_receipt(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('attach');
+    $store = lt_store();
+    $e = ledger_post($pdo, $b, ['entry_on' => '2026-03-04', 'memo' => 'Cash for copper fittings at the counter', 'actor' => 'user:7',
+        'lines' => [['account' => 'exp.office', 'debit' => 4218], ['account' => 'cash.operating', 'credit' => 4218]]]);
+    check_same([$e], array_map('intval', array_column(ledger_unsupported_entries($pdo, $b), 'id')), 'a manual entry without a receipt is not flagged');
+
+    $jpeg = lt_jpeg();
+    $id = ledger_attach($pdo, $b, ['entry_id' => $e, 'name' => 'C:\\phone\\IMG_0042.jpg', 'bytes' => $jpeg, 'kind' => 'receipt', 'actor' => 'user:7'], $store);
+    $a = ledger_attachments($pdo, $b, $e)[0];
+    check_same('image/jpeg', $a['content_type'], 'the type was not read from the file');
+    check_same('IMG_0042.jpg', $a['name'], 'the path was kept in the name');
+    check_same(hash('sha256', $jpeg), $a['sha256'], 'the fingerprint is wrong');
+    check_same([], ledger_unsupported_entries($pdo, $b), 'an entry with its receipt is still flagged');
+    check_same($id, ledger_attach($pdo, $b, ['entry_id' => $e, 'name' => 'again.jpg', 'bytes' => $jpeg, 'kind' => 'receipt'], $store), 'the same file was attached twice');
+    check_same(1, count(ledger_attachments($pdo, $b, $e)), 'a duplicate attachment was kept');
+    check_same($jpeg, ledger_attachment_read($pdo, $b, $id, $store)['bytes'], 'the file read back is not the file attached');
+
+    // A PDF and the other photo types are taken; anything else is refused whatever it is called.
+    foreach (["%PDF-1.7\n%\xE2\xE3\n1 0 obj" => 'application/pdf', "\x89PNG\r\n\x1A\n\x00\x00\x00\x0DIHDR" => 'image/png',
+              "RIFF\x24\x00\x00\x00WEBPVP8 " => 'image/webp', "\x00\x00\x00\x18ftypheic\x00\x00\x00\x00" => 'image/heic'] as $head => $type) {
+        $x = ledger_attach($pdo, $b, ['entry_id' => $e, 'name' => 'doc', 'bytes' => $head . str_repeat('x', 64), 'kind' => 'other'], $store);
+        check_same($type, (string) $pdo->query("SELECT content_type FROM ledger.attachments WHERE id = $x")->fetchColumn(), "$type not recognised");
+    }
+    foreach (['<script>alert(1)</script>' => 'a script named .jpg', '' => 'an empty file', "\xFF\xD8\xFF" . str_repeat('a', LEDGER_ATTACH_MAX_BYTES) => 'a file over 15 MB'] as $bytes => $what) {
+        try {
+            ledger_attach($pdo, $b, ['entry_id' => $e, 'name' => 'receipt.jpg', 'bytes' => $bytes], $store);
+            check(false, "$what was attached");
+        } catch (LedgerError) {
+        }
+    }
+    try {
+        ledger_attach($pdo, $b, ['entry_id' => $e, 'document_id' => 1, 'name' => 'x.jpg', 'bytes' => $jpeg], $store);
+        check(false, 'a file was attached to two things');
+    } catch (LedgerError) {
+    }
+
+    // Changed on disk: the read refuses and names the fingerprint on record.
+    $key = (string) $pdo->query("SELECT storage_key FROM ledger.attachments WHERE id = $id")->fetchColumn();
+    file_put_contents($GLOBALS['lt_store_dir'] . '/' . $key, lt_jpeg('edited'));
+    try {
+        ledger_attachment_read($pdo, $b, $id, $store);
+        check(false, 'a file changed after it was attached was served');
+    } catch (LedgerError $x) {
+        check(str_contains($x->getMessage(), $a['sha256']), 'the refusal does not name the fingerprint');
+    }
+
+    // Permanent, and private to the tenant.
+    check_refused(fn() => $pdo->exec("UPDATE ledger.attachments SET name = 'other.jpg' WHERE id = $id"), 'an attachment was renamed');
+    check_refused(fn() => $pdo->exec("DELETE FROM ledger.attachments WHERE id = $id"), 'an attachment was removed');
+    check_same(0, ledger_test_other_tenant(fn() => (int) $pdo->query("SELECT count(*) FROM ledger.attachments WHERE id = $id")->fetchColumn()), 'another tenant sees the attachment');
+    ledger_test_other_tenant(function () use ($pdo, $b, $e, $store, $jpeg) {
+        try {
+            ledger_attach($pdo, $b, ['entry_id' => $e, 'name' => 'x.jpg', 'bytes' => lt_jpeg('other tenant')], $store);
+            check(false, 'another tenant attached a file to these books');
+        } catch (LedgerError) {
+        }
+    });
+}
+
+function test_ledger_attachments_on_a_bill_support_the_entry_it_issued(): void
+{
+    ['pdo' => $pdo, 'book' => $b] = ledger_test_book('attach-bill');
+    $store = lt_store();
+    $bill = ledger_document_issue($pdo, $b, ['kind' => 'payable', 'party' => 'vendor:coastline', 'ref' => 'COAST-8840', 'issued_on' => '2026-03-14',
+        'source_key' => 'bill:8840', 'lines' => [['account' => 'exp.office', 'amount' => 438000, 'memo' => 'Parts']]]);
+    // A cash expense paid with no bill needs its receipt; a bill's entry is supported by the bill once it is attached.
+    $cash = ledger_post($pdo, $b, ['entry_on' => '2026-03-15', 'event_type' => 'expense.paid', 'memo' => 'Fuel',
+        'lines' => [['account' => 'exp.travel', 'debit' => 6000], ['account' => 'cash.operating', 'credit' => 6000]]]);
+    check_same([$cash], array_map('intval', array_column(ledger_unsupported_entries($pdo, $b), 'id')), 'only the cash expense should need a receipt');
+    $issue = (int) $pdo->query("SELECT issue_entry_id FROM ledger.documents WHERE id = $bill")->fetchColumn();
+    $types = ['expense.paid', (string) $pdo->query("SELECT event_type FROM ledger.entries WHERE id = $issue")->fetchColumn()];
+    check_same([$issue, $cash], array_map('intval', array_column(ledger_unsupported_entries($pdo, $b, null, null, $types), 'id')), 'asked about bills too, the bill without its PDF is not listed');
+    ledger_attach($pdo, $b, ['document_id' => $bill, 'name' => 'coastline-8840.pdf', 'bytes' => "%PDF-1.4\nbill", 'kind' => 'bill'], $store);
+    check_same(1, count(ledger_attachments($pdo, $b, null, $bill)), 'the bill has its PDF');
+    check_same([$cash], array_map('intval', array_column(ledger_unsupported_entries($pdo, $b, null, null, $types), 'id')), 'the bill PDF did not support its entry');
+    ledger_attach($pdo, $b, ['entry_id' => $cash, 'name' => 'fuel.heic', 'bytes' => "\x00\x00\x00\x18ftypheic\x00\x00\x00\x00 fuel", 'kind' => 'receipt'], $store);
+    check_same([], ledger_unsupported_entries($pdo, $b, null, null, $types), 'everything is supported now');
+    // Reversed entries are not asked for a receipt.
+    $oops = ledger_post($pdo, $b, ['entry_on' => '2026-03-16', 'memo' => 'Typed twice',
+        'lines' => [['account' => 'exp.office', 'debit' => 100], ['account' => 'cash.operating', 'credit' => 100]]]);
+    ledger_reverse($pdo, $b, $oops, 'rev:oops', '2026-03-16', 'user:7', 'typed twice');
+    check_same([], ledger_unsupported_entries($pdo, $b), 'a reversed entry still needs a receipt');
+}

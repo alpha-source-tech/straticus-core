@@ -15,6 +15,7 @@ is `web/app/books.php`).
 |---|---|
 | `sql/` | The `ledger` schema. Applied by `ledger_migrate()`, which a host calls before its own migrations. |
 | `ledger.php` | The engine: books, accounts, posting, documents, payments and their assignment, write-offs, reversals, trial balance, fingerprint. |
+| `attachments.php` | Supporting documents: the receipt, contract, bill or photo behind an entry or a document. Typed from the file's own bytes, fingerprinted (SHA-256), permanent, checked on every read; the host stores the bytes through `LedgerFileStore`. Lists entries still missing their document. |
 | `templates.php` | The core chart of accounts and the equity section for each tax treatment. |
 | `tests/core_tests.php` | Tests that use only the core's API. |
 | `tests/run.php` | Runs them on their own, with no host: `php core/ledger/tests/run.php`. |
@@ -31,6 +32,8 @@ is `web/app/books.php`).
 - Documents, their lines, payments and assignments keep the figures they
   were written with. A payment's assignment adds up to its amount and never
   takes a line past what it owes.
+- Attachments are photos or PDFs up to 15 MB, belong to one entry or one
+  document, are never changed or removed, and may be added after a close.
 - Row-level security keeps tenants apart.
 
 ## Two bases from one journal
